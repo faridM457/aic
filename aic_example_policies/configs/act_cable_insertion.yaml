@@ -1,0 +1,174 @@
+# ACT training recipe — AIC cable insertion
+# ==========================================
+# Usage (run from ws_aic/src/aic/ inside the pixi environment):
+#
+#   pixi run lerobot-train \
+#     --dataset.repo_id=YOUR_HF_HANDLE/aic_cable_insertion_demos \
+#     --policy.type=act \
+#     --policy.chunk_size=25 \
+#     --policy.loss_type=l1 \
+#     --training.batch_size=8 \
+#     --training.num_epochs=100 \
+#     --output_dir=outputs/act_cable_insertion
+#
+# After training, point the policy at your checkpoint:
+#
+#   export ACT_MODEL_PATH=/path/to/outputs/act_cable_insertion/checkpoints/last
+#   # OR set CableInsertion.MODEL_REPO_ID = "YOUR_HF_HANDLE/aic_cable_insertion_act"
+#
+# Prerequisites
+# -------------
+#   1. Record demos with CheatCode (ground_truth:=true required):
+#        pixi run lerobot-record \
+#          --robot.type=aic_controller \
+#          --robot.id=aic \
+#          --dataset.repo_id=YOUR_HF_HANDLE/aic_cable_insertion_demos \
+#          --dataset.single_task="Insert cable into port" \
+#          --dataset.num_episodes=50
+#      Repeat for all 3 trial types (~50 demos each = 150 total).
+#   2. Verify the dataset on HuggingFace Hub before training.
+#   3. Update dataset.repo_id below.
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  repo_id: YOUR_HF_HANDLE/aic_cable_insertion_demos  # FILL IN after lerobot-record
+
+  image_transforms:
+    enable: false  # Simulation images are clean; augmentation not needed yet.
+                   # Enable colour-jitter / random-crop for Phase 1 (real robot).
+
+# ---------------------------------------------------------------------------
+# Policy: ACT (Action Chunking with Transformers)
+# ---------------------------------------------------------------------------
+policy:
+  type: act
+
+  # --- Chunking ---
+  # Must match CableInsertion.ACT_CHUNK_SIZE = 25.
+  # Rationale: RoCo Challenge (2024) found chunk 50→20 improved precision
+  # insertion; 25 is a balanced default. Decrease to 10-15 if the policy
+  # overshoots during the final 5 mm — more frequent re-planning helps.
+  chunk_size: 25
+  n_action_steps: 25
+
+  # --- Loss function ---
+  # Must match CableInsertion.TRAINING_LOSS = "l1".
+  # L1 (MAE) keeps a constant gradient all the way to zero error, preventing
+  # the "lazy robot" failure mode where L2 loss decays to near-zero near the
+  # target and the policy stops correcting sub-mm offsets.
+  loss_type: l1
+
+  # --- Observation spaces ---
+  # Shapes must match what lerobot-record captured.
+  # Images are resized by IMAGE_SCALE = 0.25 inside CableInsertion.
+  # If your cameras are 480×640, the model sees 120×160.
+  # Verify with: pixi run lerobot-visualize-dataset --dataset.repo_id=...
+  input_shapes:
+    observation.images.left_camera:   [3, 120, 160]   # [C, H, W] after 0.25× scale
+    observation.images.center_camera: [3, 120, 160]
+    observation.images.right_camera:  [3, 120, 160]
+    # 26-D proprioceptive state — layout defined in ObservationParser.state_vector():
+    #   [0:3]   TCP position (x, y, z)
+    #   [3:7]   TCP orientation (qx, qy, qz, qw)
+    #   [7:10]  TCP linear velocity (vx, vy, vz)
+    #   [10:13] TCP angular velocity (wx, wy, wz)
+    #   [13:19] TCP error (6-DOF pose error)
+    #   [19:26] Joint positions (7 joints)
+    observation.state: [26]
+
+  # --- Action space ---
+  # 7-D Cartesian velocity: [vx, vy, vz, wx, wy, wz, unused]
+  # Recorded from CheatCode's MotionUpdate.velocity field.
+  output_shapes:
+    action: [7]
+
+  # --- Normalization ---
+  # mean_std on all channels — matches RunACT.prepare_observations() exactly.
+  # Stats are computed from the dataset and saved in the checkpoint as
+  # policy_preprocessor_step_3_normalizer_processor.safetensors.
+  input_normalization_modes:
+    observation.images.left_camera:   mean_std
+    observation.images.center_camera: mean_std
+    observation.images.right_camera:  mean_std
+    observation.state:                mean_std
+  output_normalization_modes:
+    action: mean_std
+
+  # --- Vision backbone ---
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  replace_final_stride_with_dilation: false
+
+  # --- Transformer architecture (ACT defaults) ---
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  # --- VAE (standard ACT — do not change unless you know why) ---
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0  # Weight on VAE KL-divergence term; increase if latent collapses
+  dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  # Sizing guidance:
+  #   ~150 demos × ~200 frames/demo = 30 000 frames total.
+  #   batch_size=8 → ~3 750 steps/epoch.
+  #   100 epochs → ~375 000 gradient steps. Typical ACT convergence: 50-80 epochs.
+  num_epochs: 100
+  batch_size: 8
+
+  # Learning rates — ACT standard values.
+  # If loss spikes after epoch 10, halve both lr values.
+  lr: 1.0e-5
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip_norm: 10.0
+
+  online_steps: 0  # Pure offline; RL fine-tuning is handled separately.
+
+  # Action chunk timestamps.
+  # lerobot-record captures at 20 Hz (aic_adapter publishes at 20 Hz).
+  # chunk_size=25 steps × 0.05 s/step = 1.25 s prediction horizon.
+  delta_timestamps:
+    observation.images.left_camera:   [0.0]
+    observation.images.center_camera: [0.0]
+    observation.images.right_camera:  [0.0]
+    observation.state:                [0.0]
+    action: [0.00, 0.05, 0.10, 0.15, 0.20,
+             0.25, 0.30, 0.35, 0.40, 0.45,
+             0.50, 0.55, 0.60, 0.65, 0.70,
+             0.75, 0.80, 0.85, 0.90, 0.95,
+             1.00, 1.05, 1.10, 1.15, 1.20]  # 25 values
+
+# ---------------------------------------------------------------------------
+# Evaluation (during training)
+# ---------------------------------------------------------------------------
+eval:
+  n_episodes: 5
+  batch_size: 5
+  use_async_envs: false
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+wandb:
+  enable: false
+  # Enable with: --wandb.enable=true --wandb.project=aic_cable_insertion --wandb.entity=YOUR_ENTITY
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+checkpoint:
+  save_freq: 10     # Save every 10 epochs; inspect loss curve to pick best.
+  keep_last_n: 3    # Keep only the 3 most recent to save disk space.
