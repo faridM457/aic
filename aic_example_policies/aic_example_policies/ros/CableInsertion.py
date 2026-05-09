@@ -265,6 +265,17 @@ class CableInsertion(Policy):
     # --- Connector type ---
     CONNECTOR_TYPE: str = "sfp"  # "sfp" (default) or "sc"
 
+    # --- Cable name ---
+    CABLE_NAME: str = "cable_0"
+    """Cable entity name used for demo collection and task config.
+
+    T1 and T2 use cable_0 with cable_type sfp_sc_cable (SFP plug at the tip).
+    Trial 3 uses cable_1 with cable_type sfp_sc_cable_reversed (SC plug at the tip).
+    Source: aic_engine/config/sample_config.yaml, trials.trial_*/tasks.task_1.cable_name.
+    When CONNECTOR_TYPE="sc", CABLE_NAME is automatically overridden to "cable_1"
+    in __init__; override the class variable to change the default for SFP trials.
+    """
+
     # --- Wrench tare ---
     APPLY_FTS_TARE: bool = True  # Must be True for raw aic_adapter wrench
 
@@ -350,6 +361,8 @@ class CableInsertion(Policy):
         self.device = None
         self._load_act_model()
         self._insertion_vz = -0.001 if self.CONNECTOR_TYPE == "sc" else self.INSERTION_VZ
+        if self.CONNECTOR_TYPE == "sc":
+            self.CABLE_NAME = "cable_1"
 
     # -------------------------------------------------------------------------
     # Model loading
