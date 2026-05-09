@@ -36,8 +36,33 @@ dataset:
   repo_id: YOUR_HF_HANDLE/aic_cable_insertion_demos  # FILL IN after lerobot-record
 
   image_transforms:
-    enable: false  # Simulation images are clean; augmentation not needed yet.
-                   # Enable colour-jitter / random-crop for Phase 1 (real robot).
+    enable: true
+    # FACTR-style visual corruption — applied to camera images during training only.
+    # Force/wrench and state inputs (observation.state, wrist_wrench) are never augmented.
+    # Each augmentation is sampled independently per image per training step.
+
+    # Random Gaussian blur: simulates motion blur and camera defocus.
+    gaussian_blur:
+      p: 0.5            # applied 50% of the time
+      sigma: [0.0, 2.0] # sigma uniformly sampled in [0, 2] pixels
+      kernel_size: 5    # must be odd; 5px covers ±2σ for σ≤2
+
+    # Random brightness shift: ±30% multiplicative factor on pixel values.
+    brightness_jitter:
+      p: 0.5            # applied 50% of the time
+      factor: 0.30      # brightness multiplied by Uniform[0.70, 1.30]
+
+    # Random partial occlusion: black rectangle covering 10–20% of image area.
+    random_erasing:
+      p: 0.20           # applied 20% of the time
+      scale: [0.10, 0.20]  # occluded area as fraction of total image area
+      value: 0          # fill with black (zeros)
+      ratio: [0.3, 3.3] # aspect ratio range for the erased rectangle
+
+    # Occasional full camera dropout: replace entire image tensor with zeros.
+    # Sampled per-camera per-frame independently (each camera drawn separately).
+    camera_dropout:
+      p: 0.05           # 5% probability per camera per frame
 
 # ---------------------------------------------------------------------------
 # Policy: ACT (Action Chunking with Transformers)
@@ -47,29 +72,29 @@ policy:
 
   # --- Chunking ---
   # Must match CableInsertion.ACT_CHUNK_SIZE = 25.
-  # Rationale: RoCo Challenge (2024) found chunk 50→20 improved precision
+  # Rationale: RoCo Challenge (2024) found chunk 50->20 improved precision
   # insertion; 25 is a balanced default. Decrease to 10-15 if the policy
-  # overshoots during the final 5 mm — more frequent re-planning helps.
+  # overshoots during the final 5 mm -- more frequent re-planning helps.
   chunk_size: 25
   n_action_steps: 25
 
   # --- Loss function ---
   # Must match CableInsertion.TRAINING_LOSS = "l1".
   # L1 (MAE) keeps a constant gradient all the way to zero error, preventing
-  # the "lazy robot" failure mode where L2 loss decays to near-zero near the
-  # target and the policy stops correcting sub-mm offsets.
+  # the "lazy robot" failure mode where L2 loss decays near the target and
+  # the policy stops correcting sub-mm offsets.
   loss_type: l1
 
   # --- Observation spaces ---
   # Shapes must match what lerobot-record captured.
   # Images are resized by IMAGE_SCALE = 0.25 inside CableInsertion.
-  # If your cameras are 480×640, the model sees 120×160.
+  # If your cameras are 480x640, the model sees 120x160.
   # Verify with: pixi run lerobot-visualize-dataset --dataset.repo_id=...
   input_shapes:
-    observation.images.left_camera:   [3, 120, 160]   # [C, H, W] after 0.25× scale
+    observation.images.left_camera:   [3, 120, 160]   # [C, H, W] after 0.25x scale
     observation.images.center_camera: [3, 120, 160]
     observation.images.right_camera:  [3, 120, 160]
-    # 26-D proprioceptive state — layout defined in ObservationParser.state_vector():
+    # 26-D proprioceptive state -- layout defined in ObservationParser.state_vector():
     #   [0:3]   TCP position (x, y, z)
     #   [3:7]   TCP orientation (qx, qy, qz, qw)
     #   [7:10]  TCP linear velocity (vx, vy, vz)
@@ -85,7 +110,7 @@ policy:
     action: [7]
 
   # --- Normalization ---
-  # mean_std on all channels — matches RunACT.prepare_observations() exactly.
+  # mean_std on all channels -- matches RunACT.prepare_observations() exactly.
   # Stats are computed from the dataset and saved in the checkpoint as
   # policy_preprocessor_step_3_normalizer_processor.safetensors.
   input_normalization_modes:
@@ -110,7 +135,7 @@ policy:
   n_encoder_layers: 4
   n_decoder_layers: 1
 
-  # --- VAE (standard ACT — do not change unless you know why) ---
+  # --- VAE (standard ACT -- do not change unless you know why) ---
   use_vae: true
   latent_dim: 32
   n_vae_encoder_layers: 4
@@ -122,13 +147,13 @@ policy:
 # ---------------------------------------------------------------------------
 training:
   # Sizing guidance:
-  #   ~150 demos × ~200 frames/demo = 30 000 frames total.
-  #   batch_size=8 → ~3 750 steps/epoch.
-  #   100 epochs → ~375 000 gradient steps. Typical ACT convergence: 50-80 epochs.
+  #   ~150 demos x ~200 frames/demo = 30 000 frames total.
+  #   batch_size=8 -> ~3 750 steps/epoch.
+  #   100 epochs -> ~375 000 gradient steps. Typical ACT convergence: 50-80 epochs.
   num_epochs: 100
   batch_size: 8
 
-  # Learning rates — ACT standard values.
+  # Learning rates -- ACT standard values.
   # If loss spikes after epoch 10, halve both lr values.
   lr: 1.0e-5
   lr_backbone: 1.0e-5
@@ -139,7 +164,7 @@ training:
 
   # Action chunk timestamps.
   # lerobot-record captures at 20 Hz (aic_adapter publishes at 20 Hz).
-  # chunk_size=25 steps × 0.05 s/step = 1.25 s prediction horizon.
+  # chunk_size=25 steps x 0.05 s/step = 1.25 s prediction horizon.
   delta_timestamps:
     observation.images.left_camera:   [0.0]
     observation.images.center_camera: [0.0]

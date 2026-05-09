@@ -262,6 +262,9 @@ class CableInsertion(Policy):
     MODEL_REPO_ID: str = ""
     MODEL_ENV_VAR: str = "ACT_MODEL_PATH"
 
+    # --- Connector type ---
+    CONNECTOR_TYPE: str = "sfp"  # "sfp" (default) or "sc"
+
     # --- Wrench tare ---
     APPLY_FTS_TARE: bool = True  # Must be True for raw aic_adapter wrench
 
@@ -334,6 +337,9 @@ class CableInsertion(Policy):
     # Low Z-stiffness allows compliance in the insertion direction
     _INSERT_STIFFNESS = [90.0, 90.0, 25.0, 50.0, 50.0, 50.0]
     _INSERT_DAMPING = [50.0, 50.0, 15.0, 20.0, 20.0, 20.0]
+    # Stiffer Z for SC final seating after latch click
+    _SEAT_STIFFNESS = [90.0, 90.0, 60.0, 50.0, 50.0, 50.0]
+    _SEAT_DAMPING = [50.0, 50.0, 25.0, 20.0, 20.0, 20.0]
 
     def __init__(self, parent_node):
         super().__init__(parent_node)
@@ -343,6 +349,7 @@ class CableInsertion(Policy):
         self._act_stats = None
         self.device = None
         self._load_act_model()
+        self._insertion_vz = -0.001 if self.CONNECTOR_TYPE == "sc" else self.INSERTION_VZ
 
     # -------------------------------------------------------------------------
     # Model loading
@@ -433,6 +440,7 @@ class CableInsertion(Policy):
         stiffness: Optional[list] = None,
         damping: Optional[list] = None,
         frame_id: str = "base_link",
+        feedforward_fz: float = 0.0,
     ) -> None:
         """Publish a Cartesian velocity command (MODE_VELOCITY)."""
         K = stiffness or self._ACT_STIFFNESS
@@ -449,7 +457,7 @@ class CableInsertion(Policy):
             target_stiffness=np.diag(K).flatten().tolist(),
             target_damping=np.diag(D).flatten().tolist(),
             feedforward_wrench_at_tip=Wrench(
-                force=Vector3(x=0.0, y=0.0, z=0.0),
+                force=Vector3(x=0.0, y=0.0, z=feedforward_fz),
                 torque=Vector3(x=0.0, y=0.0, z=0.0),
             ),
             wrench_feedback_gains_at_tip=[0.5, 0.5, 0.5, 0.0, 0.0, 0.0],
@@ -573,7 +581,7 @@ class CableInsertion(Policy):
         while time.time() - t_start < self.BACKOFF_SEC:
             self._send_velocity(
                 move_robot,
-                vz=-self.INSERTION_VZ * 4,   # Ascend at 4× insertion speed
+                vz=-self._insertion_vz * 4,   # Ascend at 4× insertion speed
                 stiffness=self._INSERT_STIFFNESS,
                 damping=self._INSERT_DAMPING,
             )
@@ -654,6 +662,29 @@ class CableInsertion(Policy):
         # Stop oscillation
         self._send_velocity(move_robot, stiffness=self._INSERT_STIFFNESS,
                             damping=self._INSERT_DAMPING)
+
+        # SC-specific: micro-rotation yaw sweep (±5°) to locate guide groove
+        if self.CONNECTOR_TYPE == "sc":
+            self.get_logger().info("SC: yaw sweep ±5° to locate guide groove")
+            _SC_YAW_AMP = float(np.deg2rad(5.0))
+            _SC_YAW_HZ = 0.5
+            _SC_YAW_DUR = 2.0
+            t_yaw = time.time()
+            while time.time() - t_yaw < _SC_YAW_DUR:
+                t_rel = time.time() - t_yaw
+                wz = _SC_YAW_AMP * np.sin(2 * np.pi * _SC_YAW_HZ * t_rel)
+                self._send_velocity(
+                    move_robot,
+                    wz=float(wz),
+                    stiffness=self._INSERT_STIFFNESS,
+                    damping=self._INSERT_DAMPING,
+                )
+                time.sleep(0.05)
+            self._send_velocity(
+                move_robot,
+                stiffness=self._INSERT_STIFFNESS,
+                damping=self._INSERT_DAMPING,
+            )
 
         if len(positions) < self.CALIB_MIN_SAMPLES:
             self.get_logger().warn(
@@ -741,6 +772,10 @@ class CableInsertion(Policy):
         last_progress_t = t_start
         last_progress_depth = 0.0
 
+        # SC latch-click detection state
+        fz_history: list = []  # (timestamp, abs_fz)
+        latch_engaged = False
+
         while True:
             obs = get_observation()
             if obs is None:
@@ -751,6 +786,20 @@ class CableInsertion(Policy):
             fx, fy, fz = float(w[0]), float(w[1]), float(w[2])
             f_lateral = float(np.hypot(fx, fy))
             f_total = float(np.linalg.norm(w[:3]))
+
+            # SC latch-click: spike >8 N then drop >3 N within 0.5 s
+            if self.CONNECTOR_TYPE == "sc" and not latch_engaged:
+                _now = time.time()
+                fz_history.append((_now, abs(fz)))
+                fz_history = [(_t, _f) for _t, _f in fz_history if _now - _t <= 0.5]
+                if len(fz_history) >= 2:
+                    _peak = max(_f for _, _f in fz_history)
+                    if _peak > 8.0 and (_peak - abs(fz)) > 3.0:
+                        self.get_logger().info(
+                            f"SC latch engaged (peak Fz={_peak:.1f} N, "
+                            f"current={abs(fz):.1f} N)"
+                        )
+                        latch_engaged = True
 
             current_z = self._parser.tcp_position(obs)[2]
             depth_m = start_z - current_z
@@ -800,19 +849,22 @@ class CableInsertion(Policy):
 
             # --- Velocity command: Z descent + XY force-model correction ---
             # Pause Z when lateral force is very high; keep XY correction always.
-            vz = self.INSERTION_VZ if f_lateral < self.LATERAL_BACKOFF_THRESH else 0.0
+            vz = self._insertion_vz if f_lateral < self.LATERAL_BACKOFF_THRESH else 0.0
 
             # XY: use fitted Jacobian for force-minimising direction when available;
             # falls back to fixed-gain admittance (LATERAL_GAIN × F) otherwise.
             vx, vy = self._compute_xy_correction(fx, fy, force_jacobian)
 
+            _stiffness = self._SEAT_STIFFNESS if latch_engaged else self._INSERT_STIFFNESS
+            _damping = self._SEAT_DAMPING if latch_engaged else self._INSERT_DAMPING
             self._send_velocity(
                 move_robot,
                 vx=vx,
                 vy=vy,
                 vz=vz,
-                stiffness=self._INSERT_STIFFNESS,
-                damping=self._INSERT_DAMPING,
+                stiffness=_stiffness,
+                damping=_damping,
+                feedforward_fz=2.0 if latch_engaged else 0.0,
             )
             time.sleep(0.05)
 
