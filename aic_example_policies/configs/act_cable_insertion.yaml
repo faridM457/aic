@@ -88,12 +88,12 @@ policy:
   # --- Observation spaces ---
   # Shapes must match what lerobot-record captured.
   # Images are resized by IMAGE_SCALE = 0.25 inside CableInsertion.
-  # If your cameras are 480x640, the model sees 120x160.
+  # Basler cameras are 1152×1024; after 0.25× scale the model sees 288×256 (W×H).
   # Verify with: pixi run lerobot-visualize-dataset --dataset.repo_id=...
   input_shapes:
-    observation.images.left_camera:   [3, 120, 160]   # [C, H, W] after 0.25x scale
-    observation.images.center_camera: [3, 120, 160]
-    observation.images.right_camera:  [3, 120, 160]
+    observation.images.left_camera:   [3, 256, 288]   # [C, H, W] — 1024×1152 Basler cameras × 0.25 scale
+    observation.images.center_camera: [3, 256, 288]
+    observation.images.right_camera:  [3, 256, 288]
     # 26-D proprioceptive state -- layout defined in ObservationParser.state_vector():
     #   [0:3]   TCP position (x, y, z)
     #   [3:7]   TCP orientation (qx, qy, qz, qw)

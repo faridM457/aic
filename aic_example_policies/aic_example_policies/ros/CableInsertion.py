@@ -813,6 +813,8 @@ class CableInsertion(Policy):
                             f"current={abs(fz):.1f} N)"
                         )
                         latch_engaged = True
+                        self.sleep_for(2.0)
+                        return True
 
             current_z = self._parser.tcp_position(obs)[2]
             depth_m = start_z - current_z
