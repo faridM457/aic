@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 """Generate varied Gazebo configs for AIC cable-insertion demo collection.
 
-Each output file is a complete copy of sample_config.yaml with only the
-connector translation values changed for the target trial.
+Each output file is a complete copy of sample_config.yaml with the relevant
+trial's board pose, rail positions, and fixture mounts varied.
 
-Trial   Rail varied           Mount varied          Count
-------  --------------------  --------------------  -----
-T1      nic_rail_0            sfp_mount_rail_0      50  (25 grid  + 25 random)
-T2      nic_rail_1            sfp_mount_rail_0      50  (25 grid  + 25 random)
-T3      sc_rail_1             sc_mount_rail_0       100 (25 grid  + 50 random + 25 edge)
+Trial   Card        Rails            Mount rails       Count
+------  ----------  ---------------  ----------------  -----
+T1      nic_card_0  nic_rail_0..4    sfp_mount_rail_0  150  (40 structured + 110 random)
+                                     sc_mount_rail_0
+T2      nic_card_1  nic_rail_0..4    sfp_mount_rail_0  150  (40 structured + 110 random)
+                                     sc_mount_rail_0
+T3      sc_mount_1  sc_rail_1        sfp_mount_rail_0  200  (150 random + 50 terminal)
+                                     sc_mount_rail_0
 
 Usage (run from ws_aic/src/aic/):
-
     python aic_example_policies/scripts/generate_demo_configs.py
-
-    # or with explicit paths:
-    python aic_example_policies/scripts/generate_demo_configs.py \\
-        --sample-config aic_engine/config/sample_config.yaml \\
-        --output-dir aic_example_policies/configs/demo_configs \\
-        --seed 42
 """
 
 import argparse
 import copy
+import math
 from pathlib import Path
 
 import numpy as np
 import yaml
 
 # ---------------------------------------------------------------------------
-# Translation limits (source: sample_config.yaml task_board_limits)
+# Rail limits (source: sample_config.yaml task_board_limits)
 # ---------------------------------------------------------------------------
 NIC_RAIL_MIN = -0.0215
 NIC_RAIL_MAX = 0.0234
@@ -38,62 +35,73 @@ SC_RAIL_MAX = 0.055
 MOUNT_RAIL_MIN = -0.09425
 MOUNT_RAIL_MAX = 0.09425
 
+BOARD_Z = 1.14
 
-# ---------------------------------------------------------------------------
-# Point generation helpers
-# ---------------------------------------------------------------------------
+# 8 board yaw values covering full 360°
+BOARD_YAWS = [
+    0.0,
+    math.pi / 4,       # 45°
+    math.pi / 2,       # 90°
+    3 * math.pi / 4,   # 135°
+    math.pi,           # 180°
+    5 * math.pi / 4,   # 225°
+    3 * math.pi / 2,   # 270°
+    7 * math.pi / 4,   # 315°
+]
 
-def _grid_points(n_side: int, x_min: float, x_max: float,
-                 y_min: float, y_max: float) -> list:
-    """Return n_side² points on a regular grid over [x_min,x_max]×[y_min,y_max]."""
-    xs = np.linspace(x_min, x_max, n_side)
-    ys = np.linspace(y_min, y_max, n_side)
-    return [(round(float(x), 6), round(float(y), 6))
-            for x in xs for y in ys]
+NIC_RAILS = ["nic_rail_0", "nic_rail_1", "nic_rail_2", "nic_rail_3", "nic_rail_4"]
 
+# NIC rail yaw variation ±10°
+NIC_YAW_MIN = -0.1745
+NIC_YAW_MAX = 0.1745
 
-def _random_points(n: int, x_min: float, x_max: float,
-                   y_min: float, y_max: float, rng: np.random.Generator) -> list:
-    """Return n uniform-random points inside [x_min,x_max]×[y_min,y_max]."""
-    return [(round(float(rng.uniform(x_min, x_max)), 6),
-             round(float(rng.uniform(y_min, y_max)), 6))
-            for _ in range(n)]
-
-
-def _perimeter_points(n: int, x_min: float, x_max: float,
-                      y_min: float, y_max: float) -> list:
-    """Return n points sampled uniformly around the perimeter of the rectangle.
-
-    Traversal order: bottom → right → top → left (counter-clockwise from
-    bottom-left corner).  Useful for edge-case stress testing.
-    """
-    dx = x_max - x_min
-    dy = y_max - y_min
-    perim = 2.0 * (dx + dy)
-    pts = []
-    for i in range(n):
-        t = (i / n) * perim
-        if t <= dx:
-            pts.append((round(x_min + t, 6), round(y_min, 6)))
-        elif t <= dx + dy:
-            pts.append((round(x_max, 6), round(y_min + (t - dx), 6)))
-        elif t <= 2.0 * dx + dy:
-            pts.append((round(x_max - (t - dx - dy), 6), round(y_max, 6)))
-        else:
-            pts.append((round(x_min, 6), round(y_max - (t - 2.0 * dx - dy), 6)))
-    return pts
+# Fixture mount yaw variation ±60°
+MOUNT_YAW_MIN = -1.047
+MOUNT_YAW_MAX = 1.047
 
 
 # ---------------------------------------------------------------------------
 # YAML manipulation helpers
 # ---------------------------------------------------------------------------
 
-def _set_translation(config: dict, trial_key: str, rail_key: str,
-                     value: float) -> None:
-    """Set trials.<trial>.<task_board>.<rail>.entity_pose.translation."""
-    config["trials"][trial_key]["scene"]["task_board"][rail_key][
-        "entity_pose"
-    ]["translation"] = round(float(value), 6)
+def _set_board_pose(config: dict, trial_key: str, x: float, y: float, yaw: float) -> None:
+    pose = config["trials"][trial_key]["scene"]["task_board"]["pose"]
+    pose["x"] = round(float(x), 6)
+    pose["y"] = round(float(y), 6)
+    pose["z"] = BOARD_Z
+    pose["yaw"] = round(float(yaw), 6)
+
+
+def _configure_nic_rail(
+    config: dict, trial_key: str, active_rail: str,
+    entity_name: str, translation: float, yaw: float
+) -> None:
+    """Enable one NIC rail with given pose; disable all others."""
+    task_board = config["trials"][trial_key]["scene"]["task_board"]
+    for rail in NIC_RAILS:
+        if rail == active_rail:
+            task_board[rail] = {
+                "entity_present": True,
+                "entity_name": entity_name,
+                "entity_pose": {
+                    "translation": round(float(translation), 6),
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": round(float(yaw), 6),
+                },
+            }
+        else:
+            task_board[rail] = {"entity_present": False}
+
+
+def _set_mount_pose(
+    config: dict, trial_key: str, rail_key: str,
+    translation: float, yaw: float
+) -> None:
+    """Update translation and yaw for an always-present fixture mount rail."""
+    ep = config["trials"][trial_key]["scene"]["task_board"][rail_key]["entity_pose"]
+    ep["translation"] = round(float(translation), 6)
+    ep["yaw"] = round(float(yaw), 6)
 
 
 def _save(config: dict, path: Path) -> None:
@@ -103,50 +111,157 @@ def _save(config: dict, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-trial generators
+# Config generation: T1
 # ---------------------------------------------------------------------------
 
 def generate_t1(base: dict, out: Path, rng: np.random.Generator) -> None:
-    """T1: nic_rail_0 + sfp_mount_rail_0; 25 grid + 25 random = 50 configs."""
-    pts = (
-        _grid_points(5, NIC_RAIL_MIN, NIC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX)
-        + _random_points(25, NIC_RAIL_MIN, NIC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX, rng)
-    )
-    for idx, (nic_t, sfp_t) in enumerate(pts, start=1):
-        cfg = copy.deepcopy(base)
-        _set_translation(cfg, "trial_1", "nic_rail_0", nic_t)
-        _set_translation(cfg, "trial_1", "sfp_mount_rail_0", sfp_t)
-        _save(cfg, out / "t1" / f"config_{idx:03d}.yaml")
-    print(f"T1: wrote {len(pts)} configs → {out}/t1/")
+    """T1: 150 configs. 40 structured (8 yaws × 5 rails) + 110 random."""
+    entries = []
 
+    # 40 structured: every combination of 8 board yaws × 5 NIC rails
+    for board_yaw in BOARD_YAWS:
+        for rail in NIC_RAILS:
+            entries.append({
+                "board_x":       rng.uniform(0.05, 0.35),
+                "board_y":       rng.uniform(-0.35, 0.05),
+                "board_yaw":     board_yaw,
+                "rail":          rail,
+                "nic_t":         rng.uniform(NIC_RAIL_MIN, NIC_RAIL_MAX),
+                "nic_yaw":       rng.uniform(NIC_YAW_MIN, NIC_YAW_MAX),
+                "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+                "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+                "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+                "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            })
+
+    # 110 random: fill to 150
+    for _ in range(150 - len(entries)):
+        entries.append({
+            "board_x":       rng.uniform(0.05, 0.35),
+            "board_y":       rng.uniform(-0.35, 0.05),
+            "board_yaw":     BOARD_YAWS[rng.integers(0, len(BOARD_YAWS))],
+            "rail":          NIC_RAILS[rng.integers(0, len(NIC_RAILS))],
+            "nic_t":         rng.uniform(NIC_RAIL_MIN, NIC_RAIL_MAX),
+            "nic_yaw":       rng.uniform(NIC_YAW_MIN, NIC_YAW_MAX),
+            "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+        })
+
+    for idx, e in enumerate(entries, start=1):
+        cfg = copy.deepcopy(base)
+        _set_board_pose(cfg, "trial_1", e["board_x"], e["board_y"], e["board_yaw"])
+        _configure_nic_rail(cfg, "trial_1", e["rail"], "nic_card_0",
+                            e["nic_t"], e["nic_yaw"])
+        _set_mount_pose(cfg, "trial_1", "sfp_mount_rail_0",
+                        e["sfp_mount_t"], e["sfp_mount_yaw"])
+        _set_mount_pose(cfg, "trial_1", "sc_mount_rail_0",
+                        e["sc_mount_t"], e["sc_mount_yaw"])
+        _save(cfg, out / "t1" / f"config_{idx:03d}.yaml")
+
+    print(f"T1: wrote {len(entries)} configs → {out}/t1/")
+
+
+# ---------------------------------------------------------------------------
+# Config generation: T2
+# ---------------------------------------------------------------------------
 
 def generate_t2(base: dict, out: Path, rng: np.random.Generator) -> None:
-    """T2: nic_rail_1 + sfp_mount_rail_0; 25 grid + 25 random = 50 configs."""
-    pts = (
-        _grid_points(5, NIC_RAIL_MIN, NIC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX)
-        + _random_points(25, NIC_RAIL_MIN, NIC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX, rng)
-    )
-    for idx, (nic_t, sfp_t) in enumerate(pts, start=1):
-        cfg = copy.deepcopy(base)
-        _set_translation(cfg, "trial_2", "nic_rail_1", nic_t)
-        _set_translation(cfg, "trial_2", "sfp_mount_rail_0", sfp_t)
-        _save(cfg, out / "t2" / f"config_{idx:03d}.yaml")
-    print(f"T2: wrote {len(pts)} configs → {out}/t2/")
+    """T2: 150 configs. 40 structured (8 yaws × 5 rails) + 110 random."""
+    entries = []
 
+    for board_yaw in BOARD_YAWS:
+        for rail in NIC_RAILS:
+            entries.append({
+                "board_x":       rng.uniform(0.05, 0.35),
+                "board_y":       rng.uniform(-0.35, 0.05),
+                "board_yaw":     board_yaw,
+                "rail":          rail,
+                "nic_t":         rng.uniform(NIC_RAIL_MIN, NIC_RAIL_MAX),
+                "nic_yaw":       rng.uniform(NIC_YAW_MIN, NIC_YAW_MAX),
+                "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+                "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+                "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+                "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            })
+
+    for _ in range(150 - len(entries)):
+        entries.append({
+            "board_x":       rng.uniform(0.05, 0.35),
+            "board_y":       rng.uniform(-0.35, 0.05),
+            "board_yaw":     BOARD_YAWS[rng.integers(0, len(BOARD_YAWS))],
+            "rail":          NIC_RAILS[rng.integers(0, len(NIC_RAILS))],
+            "nic_t":         rng.uniform(NIC_RAIL_MIN, NIC_RAIL_MAX),
+            "nic_yaw":       rng.uniform(NIC_YAW_MIN, NIC_YAW_MAX),
+            "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+        })
+
+    for idx, e in enumerate(entries, start=1):
+        cfg = copy.deepcopy(base)
+        _set_board_pose(cfg, "trial_2", e["board_x"], e["board_y"], e["board_yaw"])
+        _configure_nic_rail(cfg, "trial_2", e["rail"], "nic_card_1",
+                            e["nic_t"], e["nic_yaw"])
+        _set_mount_pose(cfg, "trial_2", "sfp_mount_rail_0",
+                        e["sfp_mount_t"], e["sfp_mount_yaw"])
+        _set_mount_pose(cfg, "trial_2", "sc_mount_rail_0",
+                        e["sc_mount_t"], e["sc_mount_yaw"])
+        _save(cfg, out / "t2" / f"config_{idx:03d}.yaml")
+
+    print(f"T2: wrote {len(entries)} configs → {out}/t2/")
+
+
+# ---------------------------------------------------------------------------
+# Config generation: T3
+# ---------------------------------------------------------------------------
 
 def generate_t3(base: dict, out: Path, rng: np.random.Generator) -> None:
-    """T3: sc_rail_1 + sc_mount_rail_0; 25 grid + 50 random + 25 edge = 100 configs."""
-    pts = (
-        _grid_points(5, SC_RAIL_MIN, SC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX)
-        + _random_points(50, SC_RAIL_MIN, SC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX, rng)
-        + _perimeter_points(25, SC_RAIL_MIN, SC_RAIL_MAX, MOUNT_RAIL_MIN, MOUNT_RAIL_MAX)
-    )
-    for idx, (sc_t, sc_mount_t) in enumerate(pts, start=1):
+    """T3: 200 configs. 150 random + 50 terminal (board_x ∈ [0.1, 0.2])."""
+    entries = []
+
+    # 150 random: full board x/y range
+    for _ in range(150):
+        entries.append({
+            "board_x":       rng.uniform(0.07, 0.37),
+            "board_y":       rng.uniform(-0.20, 0.20),
+            "board_yaw":     BOARD_YAWS[rng.integers(0, len(BOARD_YAWS))],
+            "sc_t":          rng.uniform(SC_RAIL_MIN, SC_RAIL_MAX),
+            "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+        })
+
+    # 50 terminal: board_x ∈ [0.1, 0.2] — near-contact insertion training
+    for _ in range(50):
+        entries.append({
+            "board_x":       rng.uniform(0.10, 0.20),
+            "board_y":       rng.uniform(-0.20, 0.20),
+            "board_yaw":     BOARD_YAWS[rng.integers(0, len(BOARD_YAWS))],
+            "sc_t":          rng.uniform(SC_RAIL_MIN, SC_RAIL_MAX),
+            "sfp_mount_t":   rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sfp_mount_yaw": rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+            "sc_mount_t":    rng.uniform(MOUNT_RAIL_MIN, MOUNT_RAIL_MAX),
+            "sc_mount_yaw":  rng.uniform(MOUNT_YAW_MIN, MOUNT_YAW_MAX),
+        })
+
+    for idx, e in enumerate(entries, start=1):
         cfg = copy.deepcopy(base)
-        _set_translation(cfg, "trial_3", "sc_rail_1", sc_t)
-        _set_translation(cfg, "trial_3", "sc_mount_rail_0", sc_mount_t)
+        _set_board_pose(cfg, "trial_3", e["board_x"], e["board_y"], e["board_yaw"])
+        # sc_rail_1: translation only (yaw fixed at 0.0 per prompt)
+        cfg["trials"]["trial_3"]["scene"]["task_board"]["sc_rail_1"]["entity_pose"][
+            "translation"
+        ] = round(float(e["sc_t"]), 6)
+        _set_mount_pose(cfg, "trial_3", "sfp_mount_rail_0",
+                        e["sfp_mount_t"], e["sfp_mount_yaw"])
+        _set_mount_pose(cfg, "trial_3", "sc_mount_rail_0",
+                        e["sc_mount_t"], e["sc_mount_yaw"])
         _save(cfg, out / "t3" / f"config_{idx:03d}.yaml")
-    print(f"T3: wrote {len(pts)} configs → {out}/t3/")
+
+    print(f"T3: wrote {len(entries)} configs → {out}/t3/")
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +308,9 @@ def main() -> None:
     generate_t3(base_config, out, rng)
 
     print(f"\nAll configs written to {out}/")
-    print("  t1/config_001..050.yaml  — T1: nic_rail_0 + sfp_mount_rail_0")
-    print("  t2/config_001..050.yaml  — T2: nic_rail_1 + sfp_mount_rail_0")
-    print("  t3/config_001..100.yaml  — T3: sc_rail_1  + sc_mount_rail_0")
+    print("  t1/config_001..150.yaml  — T1: nic_card_0 on any rail, 8 board yaws")
+    print("  t2/config_001..150.yaml  — T2: nic_card_1 on any rail, 8 board yaws")
+    print("  t3/config_001..200.yaml  — T3: sc_rail_1 varied, 50 terminal configs")
 
 
 if __name__ == "__main__":

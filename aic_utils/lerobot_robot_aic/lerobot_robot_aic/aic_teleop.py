@@ -14,6 +14,8 @@
 #  limitations under the License.
 #
 
+import math
+import os
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, cast
@@ -28,7 +30,10 @@ from lerobot.teleoperators.keyboard import (
 )
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot_teleoperator_devices import KeyboardJointTeleop, KeyboardJointTeleopConfig
+from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.time import Time as RosTime
+from tf2_ros import Buffer, TransformListener
 
 from .aic_robot import arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
@@ -340,3 +345,259 @@ class AICSpaceMouseTeleop(Teleoperator):
             self._device.close()
         self._is_connected = False
         pass
+
+
+# ---------------------------------------------------------------------------
+# AIC CheatCode Teleop — autonomous velocity-based insertion for recording
+# ---------------------------------------------------------------------------
+
+_TRIAL_DEFAULTS: dict[str, dict[str, str]] = {
+    "t1": {
+        "target_port_frame": "task_board/nic_card_mount_0/sfp_port_0_link",
+        "cable_tip_frame": "cable_0/sfp_tip_link",
+    },
+    "t2": {
+        "target_port_frame": "task_board/nic_card_mount_1/sfp_port_0_link",
+        "cable_tip_frame": "cable_0/sfp_tip_link",
+    },
+    "t3": {
+        "target_port_frame": "task_board/sc_port_1/sc_port_base_link",
+        "cable_tip_frame": "cable_1/sc_tip_link",
+    },
+}
+
+
+@TeleoperatorConfig.register_subclass("aic_cheatcode")
+@dataclass(kw_only=True)
+class AICCheatCodeTeleopConfig(TeleoperatorConfig):
+    """Configuration for the autonomous CheatCode teleop used during demo collection."""
+
+    trial_type: str = "t1"         # "t1", "t2", or "t3" — sets default frames
+    target_port_frame: str = ""    # overrides trial_type when set
+    cable_tip_frame: str = ""      # overrides trial_type when set
+
+    approach_z_offset: float = 0.15    # m above port for the approach hover point
+    approach_gain: float = 2.5         # P-gain: vel = gain * position_error
+    approach_threshold: float = 0.012  # m: switch to DESCEND when error < this
+    descent_speed: float = 0.002       # m/s downward (base_link +Z is up)
+    lateral_gain: float = 3.0          # P-gain for XY correction during descent
+    max_depth_m: float = 0.032         # m: declare insertion done when depth reaches this
+    max_speed: float = 0.08            # m/s: hard clip on all velocity components
+    done_flag_path: str = "/tmp/aic_cheatcode_done"  # written when episode is complete
+
+
+class AICCheatCodeTeleop(Teleoperator):
+    """Autonomous CheatCode teleop for lerobot-record demo collection.
+
+    Uses ground-truth TF (requires eval with ground_truth:=true) to drive the
+    gripper toward the target port without any human input.
+
+    State machine:
+        WAIT     — TF frames not yet available; returns zero velocity.
+        APPROACH — P-controller drives gripper/tcp toward (port + z_offset).
+        DESCEND  — Constant -Z velocity with XY lateral correction.
+        DONE     — Writes done_flag_path; returns zero velocity.
+
+    The collect_demos.sh script watches done_flag_path and advances the episode
+    via ``xdotool key Right`` when the flag appears.
+
+    Usage with lerobot-record:
+        pixi run lerobot-record \\
+            --robot.type=aic_controller --robot.id=aic \\
+            --robot.teleop_target_mode=cartesian \\
+            --robot.teleop_frame_id=base_link \\
+            --teleop.type=aic_cheatcode --teleop.id=aic \\
+            --teleop.trial_type=t1 \\
+            ...
+    """
+
+    def __init__(self, config: AICCheatCodeTeleopConfig) -> None:
+        super().__init__(config)
+        self.config = config
+
+        defaults = _TRIAL_DEFAULTS.get(config.trial_type, _TRIAL_DEFAULTS["t1"])
+        self._port_frame: str = config.target_port_frame or defaults["target_port_frame"]
+        self._tip_frame: str = config.cable_tip_frame or defaults["cable_tip_frame"]
+
+        self._is_connected: bool = False
+        self._node = None
+        self._tf_buffer: Buffer | None = None
+        self._executor = None
+        self._executor_thread: Thread | None = None
+
+        self._phase: str = "WAIT"
+        self._approach_target: tuple[float, float, float] | None = None
+        self._descent_start_z: float | None = None
+
+        self._zero: MotionUpdateActionDict = {
+            "linear.x": 0.0, "linear.y": 0.0, "linear.z": 0.0,
+            "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
+        }
+
+    @property
+    def name(self) -> str:
+        return "aic_cheatcode"
+
+    @property
+    def action_features(self) -> dict:
+        return MotionUpdateActionDict.__annotations__
+
+    @property
+    def feedback_features(self) -> dict:
+        return {}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    @property
+    def is_calibrated(self) -> bool:
+        return True
+
+    def calibrate(self) -> None:
+        pass
+
+    def configure(self) -> None:
+        pass
+
+    def connect(self, calibrate: bool = True) -> None:
+        if self._is_connected:
+            raise DeviceAlreadyConnectedError()
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node("aic_cheatcode_teleop")
+        self._tf_buffer = Buffer()
+        TransformListener(self._tf_buffer, self._node)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._executor_thread = Thread(target=self._executor.spin, daemon=True)
+        self._executor_thread.start()
+        self._is_connected = True
+        if os.path.exists(self.config.done_flag_path):
+            os.remove(self.config.done_flag_path)
+        print(
+            f"[aic_cheatcode] Connected. Watching TF frames:\n"
+            f"  port : {self._port_frame}\n"
+            f"  gripper: gripper/tcp"
+        )
+
+    def _lookup_xyz(self, frame: str) -> tuple[float, float, float] | None:
+        """Return (x, y, z) of frame in base_link, or None if unavailable."""
+        if self._tf_buffer is None:
+            return None
+        try:
+            tf = self._tf_buffer.lookup_transform("base_link", frame, RosTime())
+            t = tf.transform.translation
+            return (t.x, t.y, t.z)
+        except Exception:
+            return None
+
+    def _clip_vel(self, v: float) -> float:
+        return float(min(max(v, -self.config.max_speed), self.config.max_speed))
+
+    def get_action(self) -> dict[str, Any]:
+        if not self._is_connected:
+            raise DeviceNotConnectedError()
+
+        cfg = self.config
+
+        # ------------------------------------------------------------------
+        # WAIT: poll until TF frames are available
+        # ------------------------------------------------------------------
+        if self._phase == "WAIT":
+            port_xyz = self._lookup_xyz(self._port_frame)
+            tcp_xyz = self._lookup_xyz("gripper/tcp")
+            if port_xyz is None or tcp_xyz is None:
+                return cast(dict, self._zero)
+            self._approach_target = (
+                port_xyz[0],
+                port_xyz[1],
+                port_xyz[2] + cfg.approach_z_offset,
+            )
+            self._phase = "APPROACH"
+            print(
+                f"[aic_cheatcode] TF ready — port={port_xyz}  "
+                f"hover_target={self._approach_target}  → APPROACH"
+            )
+
+        # ------------------------------------------------------------------
+        # APPROACH: P-controller toward hover point above port
+        # ------------------------------------------------------------------
+        if self._phase == "APPROACH":
+            tcp_xyz = self._lookup_xyz("gripper/tcp")
+            if tcp_xyz is None or self._approach_target is None:
+                return cast(dict, self._zero)
+            tgt = self._approach_target
+            ex = tgt[0] - tcp_xyz[0]
+            ey = tgt[1] - tcp_xyz[1]
+            ez = tgt[2] - tcp_xyz[2]
+            dist = math.sqrt(ex * ex + ey * ey + ez * ez)
+            if dist < cfg.approach_threshold:
+                self._descent_start_z = tcp_xyz[2]
+                self._phase = "DESCEND"
+                print(
+                    f"[aic_cheatcode] Arrived at hover (err={dist*1000:.1f}mm) "
+                    f"start_z={self._descent_start_z:.4f}  → DESCEND"
+                )
+                return cast(dict, self._zero)
+            g = cfg.approach_gain
+            return cast(dict, {
+                "linear.x": self._clip_vel(g * ex),
+                "linear.y": self._clip_vel(g * ey),
+                "linear.z": self._clip_vel(g * ez),
+                "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
+            })
+
+        # ------------------------------------------------------------------
+        # DESCEND: constant -Z with XY correction toward port centre
+        # ------------------------------------------------------------------
+        if self._phase == "DESCEND":
+            tcp_xyz = self._lookup_xyz("gripper/tcp")
+            port_xyz = self._lookup_xyz(self._port_frame)
+            if tcp_xyz is None or port_xyz is None or self._descent_start_z is None:
+                return cast(dict, self._zero)
+            depth = self._descent_start_z - tcp_xyz[2]
+            if depth >= cfg.max_depth_m:
+                self._phase = "DONE"
+                print(
+                    f"[aic_cheatcode] Insertion complete "
+                    f"(depth={depth*1000:.1f}mm ≥ {cfg.max_depth_m*1000:.0f}mm)  → DONE"
+                )
+                with open(cfg.done_flag_path, "w") as fh:
+                    fh.write("done\n")
+                return cast(dict, self._zero)
+            ex = port_xyz[0] - tcp_xyz[0]
+            ey = port_xyz[1] - tcp_xyz[1]
+            g = cfg.lateral_gain
+            return cast(dict, {
+                "linear.x": self._clip_vel(g * ex),
+                "linear.y": self._clip_vel(g * ey),
+                "linear.z": -cfg.descent_speed,   # negative = descend (base_link +Z up)
+                "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
+            })
+
+        # ------------------------------------------------------------------
+        # DONE
+        # ------------------------------------------------------------------
+        return cast(dict, self._zero)
+
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        if self._node:
+            self._node.destroy_node()
+        if self._executor:
+            self._executor.shutdown()
+        if self._executor_thread:
+            self._executor_thread.join(timeout=2.0)
+        self._is_connected = False
+
+    def reset(self) -> None:
+        """Call between episodes to re-arm the state machine."""
+        if os.path.exists(self.config.done_flag_path):
+            os.remove(self.config.done_flag_path)
+        self._phase = "WAIT"
+        self._approach_target = None
+        self._descent_start_z = None
+        print("[aic_cheatcode] Reset for new episode")

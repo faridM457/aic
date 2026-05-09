@@ -260,10 +260,9 @@ class CableInsertion(Policy):
 
     # --- Model configuration ---
     MODEL_REPO_ID: str = ""
-    MODEL_ENV_VAR: str = "ACT_MODEL_PATH"
-
-    # --- Connector type ---
-    CONNECTOR_TYPE: str = "sfp"  # "sfp" (default) or "sc"
+    MODEL_ENV_VAR: str = "ACT_MODEL_PATH"        # fallback / combined model
+    MODEL_ENV_VAR_SFP: str = "ACT_MODEL_PATH_SFP"  # used when CONNECTOR_TYPE=="sfp"
+    MODEL_ENV_VAR_SC: str = "ACT_MODEL_PATH_SC"     # used when CONNECTOR_TYPE=="sc"
 
     # --- Cable name ---
     CABLE_NAME: str = "cable_0"
@@ -280,7 +279,7 @@ class CableInsertion(Policy):
     APPLY_FTS_TARE: bool = True  # Must be True for raw aic_adapter wrench
 
     # --- Phase 1: ACT approach ---
-    ACT_TIMEOUT_SEC: float = 25.0
+    ACT_TIMEOUT_SEC: float = 10.0
     ACT_REALIGN_TIMEOUT_SEC: float = 10.0   # Shorter budget on re-alignment retries
     ACT_HZ: float = 4.0  # Matches RunACT exactly (0.25 s loop, confirmed in RunACT.py)
     IMAGE_SCALE: float = 0.25  # Must match lerobot-record AICRobotAICControllerConfig
@@ -359,10 +358,9 @@ class CableInsertion(Policy):
         self._act_model = None
         self._act_stats = None
         self.device = None
+        self._connector_type = "sfp"
         self._load_act_model()
-        self._insertion_vz = -0.001 if self.CONNECTOR_TYPE == "sc" else self.INSERTION_VZ
-        if self.CONNECTOR_TYPE == "sc":
-            self.CABLE_NAME = "cable_1"
+        self._insertion_vz = self.INSERTION_VZ
 
     # -------------------------------------------------------------------------
     # Model loading
@@ -373,7 +371,16 @@ class CableInsertion(Policy):
             self.get_logger().warn("torch/lerobot not importable – Phase 1 disabled.")
             return
 
-        local_path = os.environ.get(self.MODEL_ENV_VAR, "")
+        # Per-connector env var takes precedence over the generic fallback.
+        per_connector_var = (
+            self.MODEL_ENV_VAR_SFP
+            if self._connector_type == "sfp"
+            else self.MODEL_ENV_VAR_SC
+        )
+        local_path = (
+            os.environ.get(per_connector_var, "")
+            or os.environ.get(self.MODEL_ENV_VAR, "")
+        )
         if not local_path and not self.MODEL_REPO_ID:
             self.get_logger().warn(
                 f"No ACT model configured. Set env var {self.MODEL_ENV_VAR} "
@@ -677,7 +684,7 @@ class CableInsertion(Policy):
                             damping=self._INSERT_DAMPING)
 
         # SC-specific: micro-rotation yaw sweep (±5°) to locate guide groove
-        if self.CONNECTOR_TYPE == "sc":
+        if self._connector_type == "sc":
             self.get_logger().info("SC: yaw sweep ±5° to locate guide groove")
             _SC_YAW_AMP = float(np.deg2rad(5.0))
             _SC_YAW_HZ = 0.5
@@ -801,7 +808,7 @@ class CableInsertion(Policy):
             f_total = float(np.linalg.norm(w[:3]))
 
             # SC latch-click: spike >8 N then drop >3 N within 0.5 s
-            if self.CONNECTOR_TYPE == "sc" and not latch_engaged:
+            if self._connector_type == "sc" and not latch_engaged:
                 _now = time.time()
                 fz_history.append((_now, abs(fz)))
                 fz_history = [(_t, _f) for _t, _f in fz_history if _now - _t <= 0.5]
@@ -894,6 +901,18 @@ class CableInsertion(Policy):
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
+        # Auto-detect connector type from task message
+        plug_type = task.plug_type
+        new_connector_type = "sc" if plug_type == "sc" else "sfp"
+        if new_connector_type != self._connector_type:
+            self._connector_type = new_connector_type
+            self._load_act_model()
+        if self._connector_type == "sc":
+            self.CABLE_NAME = "cable_1"
+        else:
+            self.CABLE_NAME = "cable_0"
+        self._insertion_vz = -0.001 if self._connector_type == "sc" else self.INSERTION_VZ
+
         self.get_logger().info(f"CableInsertion.insert_cable() task_id={task.id}")
         send_feedback("Waiting for observations…")
 
