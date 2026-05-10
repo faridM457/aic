@@ -15,6 +15,7 @@
 #
 
 
+import asyncio
 import importlib
 import inspect
 import numpy as np
@@ -43,7 +44,6 @@ from rclpy.lifecycle import (
     TransitionCallbackReturn,
 )
 from rclpy.node import Node
-from rclpy.task import Future
 from std_srvs.srv import Empty
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -260,17 +260,9 @@ class AicModel(LifecycleNode):
         while rclpy.ok():
             self.get_logger().info("insert_cable execute loop")
 
-            # First, wait a bit so this loop doesn't consume much CPU time.
-            # This must be an async wait in order for other callbacks to run.
-            wait_future = Future()
-
-            def done_waiting():
-                wait_future.set_result(None)
-
-            wait_timer = self.create_timer(1.0, done_waiting, clock=self.get_clock())
-            await wait_future
-            wait_timer.cancel()
-            self.destroy_timer(wait_timer)
+            # Wall-clock sleep so this loop advances even when /clock is not yet
+            # publishing from the simulator (sim_time freeze would block a ROS timer).
+            await asyncio.sleep(1.0)
 
             # Check if a cancellation request has arrived.
             if goal_handle.is_cancel_requested:

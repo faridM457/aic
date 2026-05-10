@@ -15,6 +15,7 @@
 #
 
 
+import time
 import numpy as np
 
 
@@ -31,7 +32,6 @@ from aic_control_interfaces.msg import (
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 from geometry_msgs.msg import Point, Pose, Quaternion, Vector3, Wrench
-from rclpy.duration import Duration
 
 
 class WaveArm(Policy):
@@ -47,11 +47,13 @@ class WaveArm(Policy):
         send_feedback: SendFeedbackCallback,
     ):
         self.get_logger().info(f"WaveArm.insert_cable() enter. Task: {task}")
-        start_time = self.time_now()
-        timeout = Duration(seconds=10.0)
+        # Use wall-clock time so the loop advances even when /clock from the
+        # simulator is not yet routing to this host-side node.
+        start_time = time.monotonic()
+        timeout_sec = 10.0
         send_feedback("waving the arm around")
-        while (self.time_now() - start_time) < timeout:
-            self.sleep_for(0.25)
+        while (time.monotonic() - start_time) < timeout_sec:
+            time.sleep(0.25)
             observation = get_observation()
 
             if observation is None:
