@@ -58,6 +58,10 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 echo "NVIDIA Container Toolkit installed."
 
+# Add user to render group for GPU hardware access in distrobox
+sudo usermod -a -G render "$USER"
+echo "NOTE: render group takes effect on next login (newgrp render or re-SSH)"
+
 # ---------------------------------------------------------------
 # 4. Pixi
 # ---------------------------------------------------------------
@@ -140,7 +144,7 @@ echo "========================================================"
 echo "Setup complete."
 echo ""
 echo "NEXT STEPS:"
-echo "  1. Run:  newgrp docker"
-echo "     (or log out and back in to pick up the docker group)"
+echo "  1. Run:  newgrp docker && newgrp render"
+echo "     (or log out and back in to pick up the docker + render groups)"
 echo "  2. Run:  scripts/verify_env.sh"
 echo "========================================================"

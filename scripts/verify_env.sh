@@ -68,9 +68,12 @@ tmux new-session -d -s aic_verify -x 220 -y 50
 tmux pipe-pane -t aic_verify:0 -o "cat >> $C1_LOG"
 tmux send-keys -t aic_verify:0 \
   "export DBX_CONTAINER_MANAGER=docker && \
-   distrobox enter -r aic_eval -- \
-     /entrypoint.sh gazebo_gui:=false launch_rviz:=false \
-                    ground_truth:=false start_aic_engine:=true" Enter
+   distrobox enter -r aic_eval -- bash -c \
+     \"export NVIDIA_DRIVER_CAPABILITIES=all && \
+       export NVIDIA_VISIBLE_DEVICES=all && \
+       GALLIUM_DRIVER=zinc MESA_GL_VERSION_OVERRIDE=4.6 \
+       /entrypoint.sh gazebo_gui:=false launch_rviz:=false \
+                      ground_truth:=false start_aic_engine:=true\"" Enter
 
 # Wait for aic_engine to send the InsertCable goal (max 120s)
 echo "Waiting for aic_engine to send InsertCable goal (up to 120s)..."
@@ -133,9 +136,12 @@ tmux new-session -d -s aic_cheatcode_test -x 220 -y 50
 tmux pipe-pane -t aic_cheatcode_test:0 -o "cat >> $C2_LOG"
 tmux send-keys -t aic_cheatcode_test:0 \
   "export DBX_CONTAINER_MANAGER=docker && \
-   distrobox enter -r aic_eval -- \
-     /entrypoint.sh gazebo_gui:=false launch_rviz:=false \
-                    ground_truth:=true start_aic_engine:=true" Enter
+   distrobox enter -r aic_eval -- bash -c \
+     \"export NVIDIA_DRIVER_CAPABILITIES=all && \
+       export NVIDIA_VISIBLE_DEVICES=all && \
+       GALLIUM_DRIVER=zinc MESA_GL_VERSION_OVERRIDE=4.6 \
+       /entrypoint.sh gazebo_gui:=false launch_rviz:=false \
+                      ground_truth:=true start_aic_engine:=true\"" Enter
 
 # Wait for aic_engine to send the InsertCable goal (max 120s)
 echo "Waiting for aic_engine to send InsertCable goal (up to 120s)..."

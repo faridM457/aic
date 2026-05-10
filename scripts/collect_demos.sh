@@ -180,13 +180,16 @@ collect_trial() {
       tmux new-session -d -s aic_collect_eval -x 220 -y 50
       tmux send-keys -t aic_collect_eval:0 \
         "export DBX_CONTAINER_MANAGER=docker && \
-         distrobox enter -r aic_eval -- \
-           /entrypoint.sh \
-             gazebo_gui:=false launch_rviz:=false \
-             ground_truth:=true start_aic_engine:=true \
-             shutdown_on_aic_engine_exit:=false \
-             model_discovery_timeout_seconds:=600 \
-             aic_engine_config_file:=${CONFIG_PATH}" Enter
+         distrobox enter -r aic_eval -- bash -c \
+           \"export NVIDIA_DRIVER_CAPABILITIES=all && \
+             export NVIDIA_VISIBLE_DEVICES=all && \
+             GALLIUM_DRIVER=zinc MESA_GL_VERSION_OVERRIDE=4.6 \
+             /entrypoint.sh \
+               gazebo_gui:=false launch_rviz:=false \
+               ground_truth:=true start_aic_engine:=true \
+               shutdown_on_aic_engine_exit:=false \
+               model_discovery_timeout_seconds:=600 \
+               aic_engine_config_file:=${CONFIG_PATH}\"" Enter
 
       echo "    Waiting 45 s for Gazebo + engine..."
       sleep 45
@@ -195,6 +198,12 @@ collect_trial() {
       docker ps | grep -q aic_eval && echo "  DIAG: eval container UP" || echo "  DIAG: eval container DOWN"
       pixi run ros2 node list 2>/dev/null | grep -q aic_controller && echo "  DIAG: aic_controller UP" || echo "  DIAG: aic_controller DOWN"
       [ -f "$DONE_FLAG" ] && echo "  DIAG: WARNING stale done flag exists" || true
+      GPU_PROC=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | grep -v "^$" || true)
+      if [ -n "$GPU_PROC" ]; then
+        echo "  DIAG: GPU in use by Gazebo — ($GPU_PROC)"
+      else
+        echo "  DIAG: WARNING — Gazebo may be on CPU (no GPU processes detected)"
+      fi
 
       # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
       tmux new-session -d -s aic_collect_model -x 220 -y 50
