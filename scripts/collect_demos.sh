@@ -23,7 +23,7 @@
 # PREREQUISITES
 #   - verify_env.sh passed (both checks)
 #   - pixi install --locked completed
-#   - distrobox aic_eval created with --nvidia
+#   - docker with NVIDIA runtime configured (nvidia-ctk runtime configure --runtime=docker)
 #   - xdotool installed (apt install xdotool)
 # -------------------------------------------------------------------------------
 
@@ -173,23 +173,28 @@ collect_trial() {
       # Tear down any leftover container so ROS controllers start clean.
       docker kill aic_eval 2>/dev/null || true
       docker rm   aic_eval 2>/dev/null || true
-      distrobox create -r --nvidia \
-        -i ghcr.io/intrinsic-dev/aic/aic_eval:latest aic_eval 2>/dev/null || true
 
-      # Pane 1: eval container with this config
+      # Pane 1: eval container — docker run directly (no distrobox wrapper) so
+      # the Docker ENTRYPOINT and NVIDIA runtime inject cleanly.
       tmux new-session -d -s aic_collect_eval -x 220 -y 50
       tmux send-keys -t aic_collect_eval:0 \
-        "export DBX_CONTAINER_MANAGER=docker && \
-         distrobox enter -r aic_eval -- bash -c \
-           \"export NVIDIA_DRIVER_CAPABILITIES=all && \
-             export NVIDIA_VISIBLE_DEVICES=all && \
-             GALLIUM_DRIVER=zinc MESA_GL_VERSION_OVERRIDE=4.6 \
-             /entrypoint.sh \
-               gazebo_gui:=false launch_rviz:=false \
-               ground_truth:=true start_aic_engine:=true \
-               shutdown_on_aic_engine_exit:=false \
-               model_discovery_timeout_seconds:=600 \
-               aic_engine_config_file:=${CONFIG_PATH}\"" Enter
+        "docker run --rm \
+           --name aic_eval \
+           --gpus all \
+           --network host \
+           -e DISPLAY=:99 \
+           -e NVIDIA_DRIVER_CAPABILITIES=all \
+           -e NVIDIA_VISIBLE_DEVICES=all \
+           -e GALLIUM_DRIVER=zinc \
+           -e MESA_GL_VERSION_OVERRIDE=4.6 \
+           -v /tmp/.X11-unix:/tmp/.X11-unix \
+           -v ${HOME}:${HOME} \
+           ghcr.io/intrinsic-dev/aic/aic_eval:latest \
+             gazebo_gui:=false launch_rviz:=false \
+             ground_truth:=true start_aic_engine:=true \
+             shutdown_on_aic_engine_exit:=false \
+             model_discovery_timeout_seconds:=600 \
+             aic_engine_config_file:=${CONFIG_PATH}" Enter
 
       echo "    Waiting 45 s for Gazebo + engine..."
       sleep 45
@@ -204,6 +209,13 @@ collect_trial() {
       else
         echo "  DIAG: WARNING — Gazebo may be on CPU (no GPU processes detected)"
       fi
+      GZ_PROC=$(docker exec aic_eval bash -c \
+        "source /ws_aic/install/setup.bash 2>/dev/null; \
+         pgrep -l 'gz\|gzserver\|ruby' 2>/dev/null || echo 'none'" 2>/dev/null \
+        || echo 'container not running')
+      echo "  DIAG: Gazebo processes: $GZ_PROC"
+      CM_CHECK=$(pixi run ros2 service list 2>/dev/null | grep controller_manager | head -3 || echo 'none')
+      echo "  DIAG: Controller manager: $CM_CHECK"
 
       # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
       tmux new-session -d -s aic_collect_model -x 220 -y 50

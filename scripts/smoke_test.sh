@@ -31,13 +31,19 @@ echo "Starting eval container (no engine, minimal setup)..."
 tmux new-session -d -s aic_smoke -x 220 -y 50
 tmux pipe-pane -t aic_smoke:0 -o "cat >> $SMOKE_LOG"
 tmux send-keys -t aic_smoke:0 \
-  "export DBX_CONTAINER_MANAGER=docker && \
-   distrobox enter -r aic_eval -- bash -c \
-     \"export NVIDIA_DRIVER_CAPABILITIES=all && \
-       export NVIDIA_VISIBLE_DEVICES=all && \
-       GALLIUM_DRIVER=zinc MESA_GL_VERSION_OVERRIDE=4.6 \
-       /entrypoint.sh gazebo_gui:=false launch_rviz:=false \
-                      ground_truth:=false start_aic_engine:=true\"" Enter
+  "docker run --rm \
+     --name aic_eval \
+     --gpus all \
+     --network host \
+     -e DISPLAY=:99 \
+     -e NVIDIA_DRIVER_CAPABILITIES=all \
+     -e NVIDIA_VISIBLE_DEVICES=all \
+     -e GALLIUM_DRIVER=zinc \
+     -e MESA_GL_VERSION_OVERRIDE=4.6 \
+     -v /tmp/.X11-unix:/tmp/.X11-unix \
+     ghcr.io/intrinsic-dev/aic/aic_eval:latest \
+       gazebo_gui:=false launch_rviz:=false \
+       ground_truth:=false start_aic_engine:=true" Enter
 
 echo "Waiting 45s for ROS to initialize..."
 sleep 45
@@ -72,5 +78,6 @@ echo "Last 10 lines of eval container output:"
 tail -10 "$SMOKE_LOG" 2>/dev/null || true
 
 tmux kill-session -t aic_smoke 2>/dev/null || true
+docker kill aic_eval 2>/dev/null || true
 
 exit $RESULT
