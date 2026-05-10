@@ -174,19 +174,14 @@ collect_trial() {
       docker kill aic_eval 2>/dev/null || true
       docker rm   aic_eval 2>/dev/null || true
 
-      # Pane 1: eval container — docker run directly (no distrobox wrapper) so
-      # the Docker ENTRYPOINT and NVIDIA runtime inject cleanly.
+      # Pane 1: Force EGL and GPU bypass for headless Gazebo.
       tmux new-session -d -s aic_collect_eval -x 220 -y 50
       tmux send-keys -t aic_collect_eval:0 \
-        "docker run --rm \
-           --name aic_eval \
-           --gpus all \
-           --network host \
+        "docker run --rm --name aic_eval --gpus all --network host \
            -e DISPLAY=:99 \
+           -e GZ_RENDERING_BACKEND=egl \
            -e NVIDIA_DRIVER_CAPABILITIES=all \
            -e NVIDIA_VISIBLE_DEVICES=all \
-           -e GALLIUM_DRIVER=zinc \
-           -e MESA_GL_VERSION_OVERRIDE=4.6 \
            -v /tmp/.X11-unix:/tmp/.X11-unix \
            -v ${HOME}:${HOME} \
            ghcr.io/intrinsic-dev/aic/aic_eval:latest \
