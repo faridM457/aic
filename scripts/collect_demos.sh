@@ -214,9 +214,9 @@ collect_trial() {
            --dataset.push_to_hub=false \
            --play_sounds=false" Enter
 
-      # Wait for the aic_cheatcode teleop to write its done flag (90 s max)
-      echo "    Waiting for insertion to complete (90 s max)..."
-      if wait_for_flag 90; then
+      # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
+      echo "    Waiting for insertion to complete (180 s max)..."
+      if wait_for_flag 180; then
         # Simulate RIGHT ARROW to save episode in lerobot-record
         sleep 1
         LEROBOT_PID=$(pgrep -f "lerobot-record" 2>/dev/null || true)
