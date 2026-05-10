@@ -34,6 +34,11 @@ export DBX_CONTAINER_MANAGER=docker
 
 pgrep Xvfb >/dev/null || Xvfb :99 -screen 0 1280x1024x24 &
 
+if ! command -v xdotool &>/dev/null; then
+  echo "Installing xdotool..."
+  sudo apt-get install -y xdotool
+fi
+
 AIC_DIR=~/ws_aic/src/aic
 CONFIG_BASE="$AIC_DIR/aic_example_policies/configs/demo_configs"
 LOG_FILE=~/ws_aic/collection_log.txt
@@ -114,7 +119,7 @@ PYEOF
 # Generate all demo configs (idempotent)
 # ---------------------------------------------------------------
 echo "Generating demo configs..."
-python3 aic_example_policies/scripts/generate_demo_configs.py
+pixi run python3 aic_example_policies/scripts/generate_demo_configs.py
 
 # ---------------------------------------------------------------
 # Generic collection loop
@@ -186,6 +191,11 @@ collect_trial() {
       echo "    Waiting 45 s for Gazebo + engine..."
       sleep 45
 
+      # Diagnostics: confirm key components are up before proceeding
+      docker ps | grep -q aic_eval && echo "  DIAG: eval container UP" || echo "  DIAG: eval container DOWN"
+      pixi run ros2 node list 2>/dev/null | grep -q aic_controller && echo "  DIAG: aic_controller UP" || echo "  DIAG: aic_controller DOWN"
+      [ -f "$DONE_FLAG" ] && echo "  DIAG: WARNING stale done flag exists" || true
+
       # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
       tmux new-session -d -s aic_collect_model -x 220 -y 50
       tmux send-keys -t aic_collect_model:0 \
@@ -217,13 +227,11 @@ collect_trial() {
       # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
       echo "    Waiting for insertion to complete (180 s max)..."
       if wait_for_flag 180; then
-        # Simulate RIGHT ARROW to save episode in lerobot-record
+        # Save the episode: inject Right Arrow into the lerobot-record tmux pane
+        # (tmux send-keys covers stdin readers; xdotool covers X11/pynput listeners)
         sleep 1
-        LEROBOT_PID=$(pgrep -f "lerobot-record" 2>/dev/null || true)
-        if [ -n "$LEROBOT_PID" ]; then
-          # Focus and send Right Arrow to save
-          xdotool key --clearmodifiers Right 2>/dev/null || true
-        fi
+        tmux send-keys -t aic_collect_rec:0 Right ''
+        xdotool key --clearmodifiers Right 2>/dev/null || true
         sleep 5
         SUCCESS=true
         break
