@@ -165,6 +165,12 @@ collect_trial() {
       kill_sessions
       sleep 2
 
+      # Tear down any leftover container so ROS controllers start clean.
+      docker kill aic_eval 2>/dev/null || true
+      docker rm   aic_eval 2>/dev/null || true
+      distrobox create -r --nvidia \
+        -i ghcr.io/intrinsic-dev/aic/aic_eval:latest aic_eval 2>/dev/null || true
+
       # Pane 1: eval container with this config
       tmux new-session -d -s aic_collect_eval -x 220 -y 50
       tmux send-keys -t aic_collect_eval:0 \
@@ -177,8 +183,8 @@ collect_trial() {
              model_discovery_timeout_seconds:=600 \
              aic_engine_config_file:=${CONFIG_PATH}" Enter
 
-      echo "    Waiting 30 s for Gazebo + engine..."
-      sleep 30
+      echo "    Waiting 45 s for Gazebo + engine..."
+      sleep 45
 
       # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
       tmux new-session -d -s aic_collect_model -x 220 -y 50
