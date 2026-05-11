@@ -73,10 +73,13 @@ tmux send-keys -t aic_verify:0 \
      --gpus all \
      --network host \
      -e DISPLAY=:99 \
+     -e GZ_RENDERING_ENGINE=ogre2 \
+     -e __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+     -e __GLX_VENDOR_LIBRARY_NAME=nvidia \
+     -e MESA_GL_VERSION_OVERRIDE=4.6 \
+     -e LIBGL_ALWAYS_SOFTWARE=0 \
      -e NVIDIA_DRIVER_CAPABILITIES=all \
      -e NVIDIA_VISIBLE_DEVICES=all \
-     -e GALLIUM_DRIVER=zinc \
-     -e MESA_GL_VERSION_OVERRIDE=4.6 \
      -v /tmp/.X11-unix:/tmp/.X11-unix \
      ghcr.io/intrinsic-dev/aic/aic_eval:latest \
        gazebo_gui:=false launch_rviz:=false \
@@ -147,10 +150,13 @@ tmux send-keys -t aic_cheatcode_test:0 \
      --gpus all \
      --network host \
      -e DISPLAY=:99 \
+     -e GZ_RENDERING_ENGINE=ogre2 \
+     -e __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+     -e __GLX_VENDOR_LIBRARY_NAME=nvidia \
+     -e MESA_GL_VERSION_OVERRIDE=4.6 \
+     -e LIBGL_ALWAYS_SOFTWARE=0 \
      -e NVIDIA_DRIVER_CAPABILITIES=all \
      -e NVIDIA_VISIBLE_DEVICES=all \
-     -e GALLIUM_DRIVER=zinc \
-     -e MESA_GL_VERSION_OVERRIDE=4.6 \
      -v /tmp/.X11-unix:/tmp/.X11-unix \
      ghcr.io/intrinsic-dev/aic/aic_eval:latest \
        gazebo_gui:=false launch_rviz:=false \

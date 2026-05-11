@@ -179,7 +179,11 @@ collect_trial() {
       tmux send-keys -t aic_collect_eval:0 \
         "docker run --rm --name aic_eval --gpus all --network host \
            -e DISPLAY=:99 \
-           -e GZ_RENDERING_BACKEND=egl \
+           -e GZ_RENDERING_ENGINE=ogre2 \
+           -e __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+           -e __GLX_VENDOR_LIBRARY_NAME=nvidia \
+           -e MESA_GL_VERSION_OVERRIDE=4.6 \
+           -e LIBGL_ALWAYS_SOFTWARE=0 \
            -e NVIDIA_DRIVER_CAPABILITIES=all \
            -e NVIDIA_VISIBLE_DEVICES=all \
            -v /tmp/.X11-unix:/tmp/.X11-unix \
