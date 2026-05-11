@@ -92,7 +92,11 @@ tare_sensor() {
 }
 
 # Write a temporary dummy policy that accepts InsertCable but does not move.
-DUMMY_POLICY_FILE=/tmp/aic_dummy_insert.py
+# File name must match the class name: aic_model resolves policy:=DummyInsert by
+# doing importlib.import_module("DummyInsert") and looking for class DummyInsert.
+# Writing as aic_dummy_insert.DummyInsert fails because Python treats the dot as
+# a package separator, not a class reference.
+DUMMY_POLICY_FILE=/tmp/DummyInsert.py
 cat > "$DUMMY_POLICY_FILE" << 'PYEOF'
 import time
 from aic_model.policy import Policy, GetObservationCallback, MoveRobotCallback, SendFeedbackCallback
@@ -221,7 +225,7 @@ collect_trial() {
       tmux send-keys -t aic_collect_model:0 \
         "cd $AIC_DIR && PYTHONPATH=/tmp pixi run ros2 run aic_model aic_model \
            --ros-args -p use_sim_time:=true \
-           -p policy:=aic_dummy_insert.DummyInsert" Enter
+           -p policy:=DummyInsert" Enter
       sleep 5
 
       # Tare before every recording session
@@ -243,6 +247,16 @@ collect_trial() {
            --dataset.num_episodes=1 \
            --dataset.push_to_hub=false \
            --play_sounds=false" Enter
+
+      # Verify lerobot-record started — give it 10s to initialize
+      sleep 10
+      if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
+        echo "  ERROR: lerobot-record failed to start (attempt $ATTEMPT) — retrying"
+        kill_sessions
+        sleep 3
+        continue
+      fi
+      echo "  DIAG: lerobot-record UP"
 
       # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
       echo "    Waiting for insertion to complete (180 s max)..."
