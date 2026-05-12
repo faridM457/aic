@@ -10,14 +10,13 @@
 # For each config:
 #   1. Start the eval container with start_aic_engine:=true and that config →
 #      the engine spawns the scene (task board + cable) with the correct rail position.
-#      /tmp is volume-mounted (done flag sharing) and ~/.cache/huggingface is
-#      volume-mounted so datasets land on the host filesystem.
-#   2. Run lerobot-record INSIDE the container via docker exec so the aic_cheatcode
-#      teleop has direct access to ground-truth TF frames. TF is not bridged to the
-#      host via zenoh, so running on the host causes the teleop to hang in WAIT phase.
-#   3. When the teleop writes /tmp/aic_cheatcode_done (visible on host via /tmp mount),
-#      the script presses RIGHT ARROW to save the episode, kills everything, and
-#      moves to the next config.
+#      ZENOH_ROUTER_CHECK_ATTEMPTS and RMW_ZENOH_CONFIG_FILE are set in the container
+#      so its zenoh session uses the same config as the host, bridging TF frames.
+#   2. Run lerobot-record on the HOST via pixi (lerobot-record is not in the container).
+#      RMW_ZENOH_CONFIG_FILE is set inline so the host zenoh session connects to the
+#      router inside the container and can read ground-truth TF frames.
+#   3. When the teleop writes /tmp/aic_cheatcode_done, the script presses RIGHT ARROW
+#      to save the episode, kills everything, and moves to the next config.
 #
 # After each trial's configs complete, the script prints the lerobot-train command.
 # Run that in a separate tmux window while T2/T3 collection continues.
@@ -164,10 +163,10 @@ collect_trial() {
            -e LIBGL_ALWAYS_SOFTWARE=0 \
            -e NVIDIA_DRIVER_CAPABILITIES=all \
            -e NVIDIA_VISIBLE_DEVICES=all \
+           -e ZENOH_ROUTER_CHECK_ATTEMPTS=10 \
+           -e RMW_ZENOH_CONFIG_FILE=/opt/ros/kilted/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json \
            -v /tmp/.X11-unix:/tmp/.X11-unix \
            -v ${HOME}:${HOME} \
-           -v /tmp:/tmp \
-           -v ~/.cache/huggingface:/root/.cache/huggingface \
            ghcr.io/intrinsic-dev/aic/aic_eval:latest \
              gazebo_gui:=false launch_rviz:=false \
              ground_truth:=true start_aic_engine:=true \
@@ -205,49 +204,44 @@ collect_trial() {
       esac
       TF_CHECK=$(timeout 5 pixi run ros2 run tf2_ros tf2_echo base_link \
         "$TF_TARGET" 2>&1 | head -5 || true)
-      # TF frames are published inside the container and are NOT bridged to the host
-      # via zenoh — failure here is expected. lerobot-record runs inside the container
-      # (Pane 3 below) where TF is directly visible.
-      echo "  DIAG: TF frame visibility from host (expected FAIL): $TF_CHECK"
+      # With RMW_ZENOH_CONFIG_FILE set on both sides, TF should be visible from host.
+      # If this shows "Waiting for transform", zenoh is still not bridging — check
+      # that the config path exists inside the container and on the host.
+      echo "  DIAG: TF frame visibility from host: $TF_CHECK"
 
       # Tare before every recording session
       tare_sensor
 
-      # Pane 3: lerobot-record runs INSIDE the container via docker exec so the
-      # aic_cheatcode teleop has direct access to ground-truth TF frames.
-      # LEROBOT_TASK is passed as an env var to avoid quoting issues with spaces.
-      # The done flag (/tmp/aic_cheatcode_done) and dataset cache are shared with
-      # the host via volume mounts on the docker run command above.
+      # Pane 3: lerobot-record on the host via pixi.
+      # RMW_ZENOH_CONFIG_FILE is set inline so the host zenoh session uses the same
+      # config as the container and can read ground-truth TF frames published inside.
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
       tmux send-keys -t aic_collect_rec:0 \
-        "docker exec -e LEROBOT_TASK='${TASK_DESC}' aic_eval bash -c \
-          'export PATH=/home/ubuntu/.pixi/bin:\$PATH && \
-           source /opt/ros/kilted/setup.bash && \
-           source /ws_aic/install/setup.bash && \
-           cd /home/ubuntu/ws_aic/src/aic && \
-           lerobot-record \
-             --robot.type=aic_controller \
-             --robot.id=aic \
-             --robot.teleop_target_mode=cartesian \
-             --robot.teleop_frame_id=base_link \
-             --teleop.type=aic_cheatcode \
-             --teleop.id=aic \
-             --teleop.trial_type=${TELEOP_TRIAL} \
-             --dataset.repo_id=${DATASET} \
-             --dataset.single_task=\"\$LEROBOT_TASK\" \
-             --dataset.num_episodes=1 \
-             --dataset.push_to_hub=false \
-             --play_sounds=false'" Enter
+        "cd $AIC_DIR && \
+         RMW_ZENOH_CONFIG_FILE=/opt/ros/kilted/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json \
+         pixi run lerobot-record \
+           --robot.type=aic_controller \
+           --robot.id=aic \
+           --robot.teleop_target_mode=cartesian \
+           --robot.teleop_frame_id=base_link \
+           --teleop.type=aic_cheatcode \
+           --teleop.id=aic \
+           --teleop.trial_type=${TELEOP_TRIAL} \
+           --dataset.repo_id=${DATASET} \
+           --dataset.single_task='${TASK_DESC}' \
+           --dataset.num_episodes=1 \
+           --dataset.push_to_hub=false \
+           --play_sounds=false" Enter
 
-      # Verify lerobot-record started inside the container — give it 10s to initialize
+      # Verify lerobot-record started — give it 10s to initialize
       sleep 10
-      if ! docker exec aic_eval pgrep -f lerobot-record >/dev/null 2>&1; then
-        echo "  ERROR: lerobot-record failed to start inside container (attempt $ATTEMPT) — retrying"
+      if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
+        echo "  ERROR: lerobot-record failed to start (attempt $ATTEMPT) — retrying"
         kill_sessions
         sleep 3
         continue
       fi
-      echo "  DIAG: lerobot-record UP (inside container)"
+      echo "  DIAG: lerobot-record UP"
 
       # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
       echo "    Waiting for insertion to complete (180 s max)..."
