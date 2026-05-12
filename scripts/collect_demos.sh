@@ -10,13 +10,19 @@
 # For each config:
 #   1. Start the eval container with start_aic_engine:=true and that config →
 #      the engine spawns the scene (task board + cable) with the correct rail position.
-#      ZENOH_ROUTER_CHECK_ATTEMPTS and RMW_ZENOH_CONFIG_FILE are set in the container
-#      so its zenoh session uses the same config as the host, bridging TF frames.
-#   2. Run lerobot-record on the HOST via pixi (lerobot-record is not in the container).
-#      RMW_ZENOH_CONFIG_FILE is set inline so the host zenoh session connects to the
-#      router inside the container and can read ground-truth TF frames.
-#   3. When the teleop writes /tmp/aic_cheatcode_done, the script presses RIGHT ARROW
-#      to save the episode, kills everything, and moves to the next config.
+#   2. Run tf_static_relay.py INSIDE the container (docker exec). Zenoh does not
+#      bridge TRANSIENT_LOCAL QoS (/tf_static) to the host despite --network host.
+#      The relay re-publishes each static transform to /tf (RELIABLE, which IS
+#      bridged) at 2 Hz, making task_board and cable frames visible to the host
+#      tf2_ros stack so the aic_cheatcode teleop can leave its WAIT phase.
+#   3. Run DummyInsert aic_model on the HOST to satisfy the aic_engine's model-
+#      discovery requirement. DummyInsert accepts InsertCable but sends no motion
+#      commands, so lerobot-record has exclusive control of the robot.
+#   4. Run lerobot-record on the HOST with aic_cheatcode teleop. Now that TF frames
+#      are visible on the host via the relay, the teleop drives the robot
+#      autonomously using ground-truth TF.
+#   5. When the teleop writes /tmp/aic_cheatcode_done, RIGHT ARROW saves the
+#      episode, then we kill everything and move to the next config.
 #
 # After each trial's configs complete, the script prints the lerobot-train command.
 # Run that in a separate tmux window while T2/T3 collection continues.
@@ -54,6 +60,7 @@ cd "$AIC_DIR"
 
 kill_sessions() {
   tmux kill-session -t aic_collect_eval  2>/dev/null || true
+  tmux kill-session -t aic_collect_relay 2>/dev/null || true
   tmux kill-session -t aic_collect_model 2>/dev/null || true
   tmux kill-session -t aic_collect_rec   2>/dev/null || true
 }
@@ -91,6 +98,34 @@ tare_sensor() {
     2>/dev/null || true
   sleep 1
 }
+
+# Write a temporary dummy policy that accepts InsertCable but does not move.
+# File name must match the class name: aic_model resolves policy:=DummyInsert by
+# doing importlib.import_module("DummyInsert") and looking for class DummyInsert.
+# Writing as aic_dummy_insert.DummyInsert fails because Python treats the dot as
+# a package separator, not a class reference.
+DUMMY_POLICY_FILE=/tmp/DummyInsert.py
+cat > "$DUMMY_POLICY_FILE" << 'PYEOF'
+import time
+from aic_model.policy import Policy, GetObservationCallback, MoveRobotCallback, SendFeedbackCallback
+from aic_task_interfaces.msg import Task
+
+class DummyInsert(Policy):
+    """Accepts InsertCable and sleeps, allowing lerobot-record to drive the robot."""
+    def insert_cable(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        self.get_logger().info(
+            f"DummyInsert: holding for 120 s (lerobot-record drives the robot)"
+        )
+        send_feedback("DummyInsert active — lerobot-record is in control")
+        time.sleep(120)
+        return True
+PYEOF
 
 # ---------------------------------------------------------------
 # Generate all demo configs (idempotent)
@@ -163,8 +198,6 @@ collect_trial() {
            -e LIBGL_ALWAYS_SOFTWARE=0 \
            -e NVIDIA_DRIVER_CAPABILITIES=all \
            -e NVIDIA_VISIBLE_DEVICES=all \
-           -e ZENOH_ROUTER_CHECK_ATTEMPTS=10 \
-           -e RMW_ZENOH_CONFIG_FILE=/opt/ros/kilted/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json \
            -v /tmp/.X11-unix:/tmp/.X11-unix \
            -v ${HOME}:${HOME} \
            ghcr.io/intrinsic-dev/aic/aic_eval:latest \
@@ -195,31 +228,61 @@ collect_trial() {
       CM_CHECK=$(pixi run ros2 service list 2>/dev/null | grep controller_manager | head -3 || echo 'none')
       echo "  DIAG: Controller manager: $CM_CHECK"
 
-      # Check if trial-specific TF frames are visible from host
+      # Determine trial-specific TF frame to check
       case "$TELEOP_TRIAL" in
         t1) TF_TARGET="task_board/nic_card_mount_0/sfp_port_0_link" ;;
         t2) TF_TARGET="task_board/nic_card_mount_1/sfp_port_0_link" ;;
         t3) TF_TARGET="task_board/sc_port_1/sc_port_base_link" ;;
         *)  TF_TARGET="task_board/nic_card_mount_0/sfp_port_0_link" ;;
       esac
-      TF_CHECK=$(timeout 5 pixi run ros2 run tf2_ros tf2_echo base_link \
-        "$TF_TARGET" 2>&1 | head -5 || true)
-      # With RMW_ZENOH_CONFIG_FILE set on both sides, TF should be visible from host.
-      # If this shows "Waiting for transform", zenoh is still not bridging — check
-      # that the config path exists inside the container and on the host.
-      echo "  DIAG: TF frame visibility from host: $TF_CHECK"
+
+      # Pane 2: tf_static relay inside the container.
+      # Zenoh does not bridge /tf_static (TRANSIENT_LOCAL QoS) to the host.
+      # The relay re-publishes each static frame to /tf (RELIABLE) at 2 Hz so
+      # the host tf2_ros stack can look up task_board and cable frames.
+      tmux new-session -d -s aic_collect_relay -x 220 -y 50
+      tmux send-keys -t aic_collect_relay:0 \
+        "docker exec aic_eval bash -c \
+          'source /ws_aic/install/setup.bash && \
+           python3 ${AIC_DIR}/scripts/tf_static_relay.py'" Enter
+      sleep 5
+
+      # Pane 3: DummyInsert aic_model — holds InsertCable action open for aic_engine.
+      # Sends no motion commands; lerobot-record (Pane 4) has exclusive robot control.
+      tmux new-session -d -s aic_collect_model -x 220 -y 50
+      tmux send-keys -t aic_collect_model:0 \
+        "cd $AIC_DIR && PYTHONPATH=/tmp pixi run ros2 run aic_model aic_model \
+           --ros-args -p use_sim_time:=true \
+           -p policy:=DummyInsert" Enter
+      sleep 5
+
+      # Wait up to 30 s for TF frames to appear on host via the relay.
+      echo "    Waiting for TF frames to become available on host (30 s max)..."
+      TF_ELAPSED=0
+      TF_READY=false
+      while [ $TF_ELAPSED -lt 30 ]; do
+        TF_POLL=$(timeout 3 pixi run ros2 run tf2_ros tf2_echo base_link \
+          "$TF_TARGET" 2>&1 | head -3 || true)
+        if echo "$TF_POLL" | grep -q "Translation:"; then
+          TF_READY=true
+          echo "  DIAG: TF frames visible on host after ${TF_ELAPSED}s — relay working"
+          break
+        fi
+        sleep 5
+        TF_ELAPSED=$((TF_ELAPSED + 5))
+      done
+      if ! $TF_READY; then
+        echo "  DIAG: WARNING — TF not yet visible; aic_cheatcode teleop will wait in WAIT phase"
+      fi
 
       # Tare before every recording session
       tare_sensor
 
-      # Pane 3: lerobot-record on the host via pixi.
-      # RMW_ZENOH_CONFIG_FILE is set inline so the host zenoh session uses the same
-      # config as the container and can read ground-truth TF frames published inside.
+      # Pane 4: lerobot-record on the host with aic_cheatcode teleop.
+      # TF frames are now bridged to the host via the tf_static relay (Pane 2).
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
       tmux send-keys -t aic_collect_rec:0 \
-        "cd $AIC_DIR && \
-         RMW_ZENOH_CONFIG_FILE=/opt/ros/kilted/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json \
-         pixi run lerobot-record \
+        "cd $AIC_DIR && pixi run lerobot-record \
            --robot.type=aic_controller \
            --robot.id=aic \
            --robot.teleop_target_mode=cartesian \
@@ -242,6 +305,13 @@ collect_trial() {
         continue
       fi
       echo "  DIAG: lerobot-record UP"
+
+      # Wait 15s then verify motion commands are being sent.
+      # If aic_cheatcode sees TF it leaves WAIT phase and publishes to motion_update.
+      sleep 15
+      MOTION_CHECK=$(timeout 8 pixi run ros2 topic hz /aic_controller/motion_update \
+        --window 5 2>/dev/null | grep "average rate" | head -1 || echo "no data")
+      echo "  DIAG: Motion commands: $MOTION_CHECK"
 
       # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
       echo "    Waiting for insertion to complete (180 s max)..."
