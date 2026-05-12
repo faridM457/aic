@@ -149,11 +149,11 @@ collect_trial() {
       sleep 2
 
       # Tear down any leftover container so ROS controllers start clean.
-      docker kill aic_eval 2>/dev/null || true
-      docker rm   aic_eval 2>/dev/null || true
+      docker rm -f aic_eval 2>/dev/null || true
 
       # Pane 1: Force EGL and GPU bypass for headless Gazebo.
       tmux new-session -d -s aic_collect_eval -x 220 -y 50
+      docker rm -f aic_eval 2>/dev/null || true
       tmux send-keys -t aic_collect_eval:0 \
         "docker run --rm --name aic_eval --gpus all --network host \
            -e DISPLAY=:99 \
