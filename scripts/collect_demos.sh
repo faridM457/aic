@@ -220,6 +220,17 @@ collect_trial() {
       CM_CHECK=$(pixi run ros2 service list 2>/dev/null | grep controller_manager | head -3 || echo 'none')
       echo "  DIAG: Controller manager: $CM_CHECK"
 
+      # Check if trial-specific TF frames are visible from host
+      case "$TELEOP_TRIAL" in
+        t1) TF_TARGET="task_board/nic_card_mount_0/sfp_port_0_link" ;;
+        t2) TF_TARGET="task_board/nic_card_mount_1/sfp_port_0_link" ;;
+        t3) TF_TARGET="task_board/sc_port_1/sc_port_base_link" ;;
+        *)  TF_TARGET="task_board/nic_card_mount_0/sfp_port_0_link" ;;
+      esac
+      TF_CHECK=$(timeout 5 pixi run ros2 run tf2_ros tf2_echo base_link \
+        "$TF_TARGET" 2>&1 | head -5 || true)
+      echo "  DIAG: TF frame visibility: $TF_CHECK"
+
       # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
       tmux new-session -d -s aic_collect_model -x 220 -y 50
       tmux send-keys -t aic_collect_model:0 \
@@ -227,6 +238,27 @@ collect_trial() {
            --ros-args -p use_sim_time:=true \
            -p policy:=DummyInsert" Enter
       sleep 5
+
+      # Wait up to 30 s for TF frames to be visible from host before starting lerobot-record.
+      # The aic_cheatcode teleop stays in WAIT phase until these frames appear; polling here
+      # surfaces the problem early and avoids a silent 180s timeout.
+      echo "    Waiting for TF frames to become available (30 s max)..."
+      TF_ELAPSED=0
+      TF_READY=false
+      while [ $TF_ELAPSED -lt 30 ]; do
+        TF_POLL=$(timeout 3 pixi run ros2 run tf2_ros tf2_echo base_link \
+          "$TF_TARGET" 2>&1 | head -3 || true)
+        if echo "$TF_POLL" | grep -q "Translation:"; then
+          TF_READY=true
+          echo "  DIAG: TF frames visible from host after ${TF_ELAPSED}s"
+          break
+        fi
+        sleep 5
+        TF_ELAPSED=$((TF_ELAPSED + 5))
+      done
+      if ! $TF_READY; then
+        echo "  DIAG: WARNING — TF frames not visible from host after 30s; lerobot-record will hang in WAIT phase"
+      fi
 
       # Tare before every recording session
       tare_sensor
