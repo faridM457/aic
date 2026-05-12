@@ -10,12 +10,14 @@
 # For each config:
 #   1. Start the eval container with start_aic_engine:=true and that config →
 #      the engine spawns the scene (task board + cable) with the correct rail position.
-#   2. Start a dummy aic_model policy that accepts InsertCable but does NOT move
-#      the robot (just sleeps). This satisfies the engine's model-discovery timeout.
-#   3. Start lerobot-record with aic_cheatcode teleop → the teleop drives the robot
-#      autonomously using ground-truth TF. No conflict: dummy model sends no motion cmds.
-#   4. When the teleop writes /tmp/aic_cheatcode_done, xdotool presses RIGHT ARROW
-#      to save the episode, then we kill everything and move to the next config.
+#      /tmp is volume-mounted (done flag sharing) and ~/.cache/huggingface is
+#      volume-mounted so datasets land on the host filesystem.
+#   2. Run lerobot-record INSIDE the container via docker exec so the aic_cheatcode
+#      teleop has direct access to ground-truth TF frames. TF is not bridged to the
+#      host via zenoh, so running on the host causes the teleop to hang in WAIT phase.
+#   3. When the teleop writes /tmp/aic_cheatcode_done (visible on host via /tmp mount),
+#      the script presses RIGHT ARROW to save the episode, kills everything, and
+#      moves to the next config.
 #
 # After each trial's configs complete, the script prints the lerobot-train command.
 # Run that in a separate tmux window while T2/T3 collection continues.
@@ -91,34 +93,6 @@ tare_sensor() {
   sleep 1
 }
 
-# Write a temporary dummy policy that accepts InsertCable but does not move.
-# File name must match the class name: aic_model resolves policy:=DummyInsert by
-# doing importlib.import_module("DummyInsert") and looking for class DummyInsert.
-# Writing as aic_dummy_insert.DummyInsert fails because Python treats the dot as
-# a package separator, not a class reference.
-DUMMY_POLICY_FILE=/tmp/DummyInsert.py
-cat > "$DUMMY_POLICY_FILE" << 'PYEOF'
-import time
-from aic_model.policy import Policy, GetObservationCallback, MoveRobotCallback, SendFeedbackCallback
-from aic_task_interfaces.msg import Task
-
-class DummyInsert(Policy):
-    """Accepts InsertCable and sleeps, allowing lerobot-record to drive the robot."""
-    def insert_cable(
-        self,
-        task: Task,
-        get_observation: GetObservationCallback,
-        move_robot: MoveRobotCallback,
-        send_feedback: SendFeedbackCallback,
-    ) -> bool:
-        self.get_logger().info(
-            f"DummyInsert: holding for 120 s (lerobot-record drives the robot)"
-        )
-        send_feedback("DummyInsert active — lerobot-record is in control")
-        time.sleep(120)
-        return True
-PYEOF
-
 # ---------------------------------------------------------------
 # Generate all demo configs (idempotent)
 # ---------------------------------------------------------------
@@ -192,6 +166,8 @@ collect_trial() {
            -e NVIDIA_VISIBLE_DEVICES=all \
            -v /tmp/.X11-unix:/tmp/.X11-unix \
            -v ${HOME}:${HOME} \
+           -v /tmp:/tmp \
+           -v ~/.cache/huggingface:/root/.cache/huggingface \
            ghcr.io/intrinsic-dev/aic/aic_eval:latest \
              gazebo_gui:=false launch_rviz:=false \
              ground_truth:=true start_aic_engine:=true \
@@ -229,66 +205,49 @@ collect_trial() {
       esac
       TF_CHECK=$(timeout 5 pixi run ros2 run tf2_ros tf2_echo base_link \
         "$TF_TARGET" 2>&1 | head -5 || true)
-      echo "  DIAG: TF frame visibility: $TF_CHECK"
-
-      # Pane 2: dummy aic_model (satisfies engine discovery; does not move robot)
-      tmux new-session -d -s aic_collect_model -x 220 -y 50
-      tmux send-keys -t aic_collect_model:0 \
-        "cd $AIC_DIR && PYTHONPATH=/tmp pixi run ros2 run aic_model aic_model \
-           --ros-args -p use_sim_time:=true \
-           -p policy:=DummyInsert" Enter
-      sleep 5
-
-      # Wait up to 30 s for TF frames to be visible from host before starting lerobot-record.
-      # The aic_cheatcode teleop stays in WAIT phase until these frames appear; polling here
-      # surfaces the problem early and avoids a silent 180s timeout.
-      echo "    Waiting for TF frames to become available (30 s max)..."
-      TF_ELAPSED=0
-      TF_READY=false
-      while [ $TF_ELAPSED -lt 30 ]; do
-        TF_POLL=$(timeout 3 pixi run ros2 run tf2_ros tf2_echo base_link \
-          "$TF_TARGET" 2>&1 | head -3 || true)
-        if echo "$TF_POLL" | grep -q "Translation:"; then
-          TF_READY=true
-          echo "  DIAG: TF frames visible from host after ${TF_ELAPSED}s"
-          break
-        fi
-        sleep 5
-        TF_ELAPSED=$((TF_ELAPSED + 5))
-      done
-      if ! $TF_READY; then
-        echo "  DIAG: WARNING — TF frames not visible from host after 30s; lerobot-record will hang in WAIT phase"
-      fi
+      # TF frames are published inside the container and are NOT bridged to the host
+      # via zenoh — failure here is expected. lerobot-record runs inside the container
+      # (Pane 3 below) where TF is directly visible.
+      echo "  DIAG: TF frame visibility from host (expected FAIL): $TF_CHECK"
 
       # Tare before every recording session
       tare_sensor
 
-      # Pane 3: lerobot-record with aic_cheatcode teleop (1 episode)
+      # Pane 3: lerobot-record runs INSIDE the container via docker exec so the
+      # aic_cheatcode teleop has direct access to ground-truth TF frames.
+      # LEROBOT_TASK is passed as an env var to avoid quoting issues with spaces.
+      # The done flag (/tmp/aic_cheatcode_done) and dataset cache are shared with
+      # the host via volume mounts on the docker run command above.
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
       tmux send-keys -t aic_collect_rec:0 \
-        "cd $AIC_DIR && pixi run lerobot-record \
-           --robot.type=aic_controller \
-           --robot.id=aic \
-           --robot.teleop_target_mode=cartesian \
-           --robot.teleop_frame_id=base_link \
-           --teleop.type=aic_cheatcode \
-           --teleop.id=aic \
-           --teleop.trial_type=${TELEOP_TRIAL} \
-           --dataset.repo_id=${DATASET} \
-           --dataset.single_task='${TASK_DESC}' \
-           --dataset.num_episodes=1 \
-           --dataset.push_to_hub=false \
-           --play_sounds=false" Enter
+        "docker exec -e LEROBOT_TASK='${TASK_DESC}' aic_eval bash -c \
+          'export PATH=/home/ubuntu/.pixi/bin:\$PATH && \
+           source /opt/ros/kilted/setup.bash && \
+           source /ws_aic/install/setup.bash && \
+           cd /home/ubuntu/ws_aic/src/aic && \
+           lerobot-record \
+             --robot.type=aic_controller \
+             --robot.id=aic \
+             --robot.teleop_target_mode=cartesian \
+             --robot.teleop_frame_id=base_link \
+             --teleop.type=aic_cheatcode \
+             --teleop.id=aic \
+             --teleop.trial_type=${TELEOP_TRIAL} \
+             --dataset.repo_id=${DATASET} \
+             --dataset.single_task=\"\$LEROBOT_TASK\" \
+             --dataset.num_episodes=1 \
+             --dataset.push_to_hub=false \
+             --play_sounds=false'" Enter
 
-      # Verify lerobot-record started — give it 10s to initialize
+      # Verify lerobot-record started inside the container — give it 10s to initialize
       sleep 10
-      if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
-        echo "  ERROR: lerobot-record failed to start (attempt $ATTEMPT) — retrying"
+      if ! docker exec aic_eval pgrep -f lerobot-record >/dev/null 2>&1; then
+        echo "  ERROR: lerobot-record failed to start inside container (attempt $ATTEMPT) — retrying"
         kill_sessions
         sleep 3
         continue
       fi
-      echo "  DIAG: lerobot-record UP"
+      echo "  DIAG: lerobot-record UP (inside container)"
 
       # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
       echo "    Waiting for insertion to complete (180 s max)..."
