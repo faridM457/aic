@@ -247,8 +247,24 @@ collect_trial() {
            python3 ${AIC_DIR}/scripts/tf_static_relay.py'" Enter
       sleep 5
 
+      # DIAG: Show what the relay has cached so far and whether any task_board
+      # frames are already visible on host (expected: none yet, task board spawns
+      # only after aic_engine discovers DummyInsert below).
+      sleep 10
+      echo "  DIAG: Relay cached frames (inside container):"
+      docker exec aic_eval bash -c \
+        "source /opt/ros/kilted/setup.bash && source /ws_aic/install/setup.bash && \
+         timeout 3 ros2 topic echo /tf --once 2>/dev/null | grep child_frame_id | head -10" \
+        2>/dev/null || echo "    (none yet)"
+      echo "  DIAG: task_board TF on host:"
+      pixi run ros2 topic echo /tf --once 2>/dev/null | grep "task_board" | head -5 \
+        2>/dev/null || echo "    (not visible yet — expected before DummyInsert)"
+
       # Pane 3: DummyInsert aic_model — holds InsertCable action open for aic_engine.
       # Sends no motion commands; lerobot-record (Pane 4) has exclusive robot control.
+      # NOTE: We keep DummyInsert running alongside lerobot-record (fallback approach).
+      # Killing DummyInsert mid-goal causes aic_engine to lose the action connection and
+      # exit the trial, so the handoff to a new aic_model node is not safe here.
       tmux new-session -d -s aic_collect_model -x 220 -y 50
       tmux send-keys -t aic_collect_model:0 \
         "cd $AIC_DIR && PYTHONPATH=/tmp pixi run ros2 run aic_model aic_model \
@@ -256,11 +272,32 @@ collect_trial() {
            -p policy:=DummyInsert" Enter
       sleep 5
 
-      # Wait up to 30 s for TF frames to appear on host via the relay.
-      echo "    Waiting for TF frames to become available on host (30 s max)..."
+      # Wait for aic_engine to discover DummyInsert and spawn the task board.
+      # aic_engine spawns task_board+cable AFTER accepting the InsertCable goal,
+      # so task_board TF frames only appear after this event.
+      echo "    Watching for task board spawn in container logs (60s max)..."
+      SPAWN_ELAPSED=0
+      SPAWN_DONE=false
+      while [ $SPAWN_ELAPSED -lt 60 ]; do
+        if docker logs aic_eval 2>&1 | tail -200 | grep -qiE "spawn|task.board|insert.cable.*(accept|goal|start|begin)"; then
+          echo "  DIAG: task board spawn event detected at ${SPAWN_ELAPSED}s"
+          SPAWN_DONE=true
+          break
+        fi
+        sleep 3
+        SPAWN_ELAPSED=$((SPAWN_ELAPSED + 3))
+      done
+      if ! $SPAWN_DONE; then
+        echo "  DIAG: WARNING — no spawn event detected in 60s, proceeding anyway"
+      fi
+
+      # Wait up to 60 s for TF frames to appear on host via the relay.
+      # Extended from 30s: task board spawns after aic_engine discovers DummyInsert,
+      # which may take additional seconds after DummyInsert starts.
+      echo "    Waiting for TF frames to become available on host (60 s max)..."
       TF_ELAPSED=0
       TF_READY=false
-      while [ $TF_ELAPSED -lt 30 ]; do
+      while [ $TF_ELAPSED -lt 60 ]; do
         TF_POLL=$(timeout 3 pixi run ros2 run tf2_ros tf2_echo base_link \
           "$TF_TARGET" 2>&1 | head -3 || true)
         if echo "$TF_POLL" | grep -q "Translation:"; then
