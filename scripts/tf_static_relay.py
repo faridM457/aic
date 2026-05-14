@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Re-publishes /tf_static transforms to /tf at 2 Hz so host-side nodes
-(which can receive /tf but not TRANSIENT_LOCAL /tf_static) can see them.
-Runs inside the container via docker exec.
+Re-publishes /tf_static transforms to /tf at 2 Hz so host-side nodes can see them.
+
+Runs on the HOST via pixi BEFORE docker run. ground_truth_static_tf_publisher
+publishes /tf_static (TRANSIENT_LOCAL) exactly once when the task board spawns
+then shuts down. Zenoh cannot replay cached TRANSIENT_LOCAL messages to late
+subscribers across the container boundary, so this relay must already be
+subscribed when the live publish occurs.
 """
 import rclpy
 from rclpy.node import Node
@@ -50,7 +54,10 @@ class TFStaticRelay(Node):
 
 
 def main():
-    rclpy.init()
+    try:
+        rclpy.init()
+    except RuntimeError:
+        pass  # already initialized
     node = TFStaticRelay()
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
