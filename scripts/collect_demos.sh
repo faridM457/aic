@@ -285,7 +285,7 @@ collect_trial() {
       SPAWN_ELAPSED=0
       SPAWN_DONE=false
       while [ $SPAWN_ELAPSED -lt 60 ]; do
-        if docker logs aic_eval 2>&1 | tail -200 | grep -qiE "spawn|task.board|insert.cable.*(accept|goal|start|begin)"; then
+        if docker logs aic_eval 2>&1 | tail -200 | grep -qF "Successfully spawned task_board"; then
           echo "  DIAG: task board spawn event detected at ${SPAWN_ELAPSED}s"
           SPAWN_DONE=true
           break
