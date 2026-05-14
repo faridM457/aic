@@ -12,7 +12,7 @@ from tf2_msgs.msg import TFMessage
 
 class TFStaticRelay(Node):
     def __init__(self):
-        super().__init__('tf_static_relay')
+        super().__init__('aic_tf_static_relay')
 
         transient_qos = QoSProfile(
             depth=100,
@@ -52,7 +52,15 @@ class TFStaticRelay(Node):
 def main():
     rclpy.init()
     node = TFStaticRelay()
-    rclpy.spin(node)
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':
