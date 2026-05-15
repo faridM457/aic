@@ -33,6 +33,7 @@ from lerobot_teleoperator_devices import KeyboardJointTeleop, KeyboardJointTeleo
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.time import Time as RosTime
+from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformListener
 
 from .aic_robot import arm_joint_names
@@ -422,6 +423,7 @@ class AICCheatCodeTeleop(Teleoperator):
         self._is_connected: bool = False
         self._node = None
         self._tf_buffer: Buffer | None = None
+        self._scoring_tf_sub = None
         self._executor = None
         self._executor_thread: Thread | None = None
 
@@ -468,6 +470,8 @@ class AICCheatCodeTeleop(Teleoperator):
         self._node = rclpy.create_node("aic_cheatcode_teleop")
         self._tf_buffer = Buffer()
         TransformListener(self._tf_buffer, self._node)
+        self._scoring_tf_sub = self._node.create_subscription(
+            TFMessage, '/scoring/tf', self._on_scoring_tf, 10)
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._executor_thread = Thread(target=self._executor.spin, daemon=True)
@@ -480,6 +484,17 @@ class AICCheatCodeTeleop(Teleoperator):
             f"  port : {self._port_frame}\n"
             f"  gripper: gripper/tcp"
         )
+
+    def _on_scoring_tf(self, msg: TFMessage) -> None:
+        """Feed /scoring/tf transforms into the tf2 buffer for frame lookup.
+
+        /scoring/tf uses RELIABLE QoS and is bridged by Zenoh from the container
+        to the host. task_board frames are published here (not on /tf_static which
+        uses TRANSIENT_LOCAL and is not bridged). Calling set_transform makes them
+        available to _lookup_xyz via the normal tf2 buffer lookup.
+        """
+        for transform in msg.transforms:
+            self._tf_buffer.set_transform(transform, 'scoring_tf')
 
     def _lookup_xyz(self, frame: str) -> tuple[float, float, float] | None:
         """Return (x, y, z) of frame in base_link, or None if unavailable."""
