@@ -243,15 +243,23 @@ collect_trial() {
       # and feeds task_board transforms into its tf2 buffer via set_transform().
       LOCAL_DS_ROOT="${HF_LEROBOT_HOME:-$HOME/.cache/huggingface/lerobot}/${DATASET}"
       REC_RESUME_ARG=""
-      if [ -f "$LOCAL_DS_ROOT/meta/info.json" ]; then
+      if [ -f "$LOCAL_DS_ROOT/meta/info.json" ] &&
+         [ -f "$LOCAL_DS_ROOT/meta/tasks.parquet" ] &&
+         [ -d "$LOCAL_DS_ROOT/meta/episodes" ]; then
         REC_RESUME_ARG="--resume=true"
         echo "  DIAG: Resuming existing LeRobot dataset at $LOCAL_DS_ROOT"
+      elif [ -e "$LOCAL_DS_ROOT" ]; then
+        INCOMPLETE_ROOT="${LOCAL_DS_ROOT}.incomplete.$(date +%s)"
+        echo "  DIAG: Archiving incomplete LeRobot dataset root:"
+        echo "        $LOCAL_DS_ROOT -> $INCOMPLETE_ROOT"
+        mv "$LOCAL_DS_ROOT" "$INCOMPLETE_ROOT"
       fi
       > "$REC_LOG"
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
-      tmux pipe-pane -t aic_collect_rec:0 -o "cat >> $REC_LOG"
       tmux send-keys -t aic_collect_rec:0 \
-        "cd $AIC_DIR && PYTHONUNBUFFERED=1 pixi run lerobot-record \
+        "cd $AIC_DIR && { \
+          echo '[aic_collect] starting lerobot-record at '\"\$(date)\"; \
+          PYTHONUNBUFFERED=1 pixi run lerobot-record \
            --robot.type=aic_controller \
            --robot.id=aic \
            --robot.teleop_target_mode=cartesian \
@@ -265,7 +273,11 @@ collect_trial() {
            --dataset.num_episodes=1 \
            --dataset.push_to_hub=false \
            ${REC_RESUME_ARG} \
-           --play_sounds=false" Enter
+           --play_sounds=false; \
+          status=\$?; \
+          echo '[aic_collect] lerobot-record exit code: '\$status; \
+          exit \$status; \
+        } >> '$REC_LOG' 2>&1" Enter
 
       # Verify lerobot-record reaches teleop.connect(). LeRobot creates the
       # aic_cheatcode_teleop node only after dataset setup and robot.connect().
