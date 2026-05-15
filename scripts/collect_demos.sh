@@ -10,13 +10,14 @@
 # For each config:
 #   1. Start the eval container with start_aic_engine:=true and that config →
 #      the engine spawns the scene (task board + cable) with the correct rail position.
-#   2. Run tf_static_relay.py INSIDE the container via docker exec after the task
-#      board spawns. Zenoh does not bridge TRANSIENT_LOCAL QoS (/tf_static) across
-#      the container/host boundary, so the relay must run inside the container where
-#      it can subscribe to /tf_static (TRANSIENT_LOCAL) and receive all cached frames.
-#      The relay re-publishes everything to /tf (RELIABLE) at 2 Hz. Since /tf IS
-#      bridged by Zenoh, host tf2 buffers see the task_board frames and the
-#      aic_cheatcode teleop can leave its WAIT phase.
+#   2. Run tf_static_relay.py INSIDE the container via docker exec BEFORE DummyInsert
+#      starts. Zenoh does not bridge TRANSIENT_LOCAL QoS (/tf_static) across the
+#      container boundary, so the relay must be inside the container. Critically, the
+#      relay must be subscribed BEFORE the task board spawns: ground_truth publishes
+#      /tf_static once (TRANSIENT_LOCAL) when the task board spawns then shuts down;
+#      TRANSIENT_LOCAL cache delivery fails if the subscriber connects after the
+#      publisher exits. The relay re-publishes to /tf (RELIABLE) at 2 Hz, which Zenoh
+#      bridges to the host so the aic_cheatcode teleop can leave its WAIT phase.
 #   3. Run DummyInsert aic_model on the HOST to satisfy the aic_engine's model-
 #      discovery requirement. DummyInsert accepts InsertCable but sends no motion
 #      commands, so lerobot-record has exclusive control of the robot.
@@ -238,6 +239,21 @@ collect_trial() {
         *)  TF_TARGET="task_board/nic_card_mount_0/sfp_port_0_link" ;;
       esac
 
+      # Start tf_static_relay inside the container BEFORE DummyInsert.
+      # /tf_static uses TRANSIENT_LOCAL QoS; Zenoh does not bridge TRANSIENT_LOCAL
+      # across the container boundary, so the relay must run inside the container.
+      # The relay must be subscribed BEFORE ground_truth_static_tf_publisher
+      # publishes — that publisher fires once when the task board spawns then exits.
+      # TRANSIENT_LOCAL cache delivery fails if the subscriber connects after the
+      # publisher has already shut down, so the relay must be ready first.
+      tmux new-session -d -s aic_collect_relay -x 220 -y 50
+      tmux send-keys -t aic_collect_relay:0 \
+        "docker exec aic_eval bash -c \
+          'source /ws_aic/install/setup.bash && \
+           python3 ${AIC_DIR}/scripts/tf_static_relay.py'" Enter
+      echo "    Waiting 5s for relay to initialize and subscribe to /tf_static..."
+      sleep 5
+
       # Pane 3: DummyInsert aic_model — holds InsertCable action open for aic_engine.
       # Sends no motion commands; lerobot-record (Pane 4) has exclusive robot control.
       # NOTE: We keep DummyInsert running alongside lerobot-record (fallback approach).
@@ -252,7 +268,8 @@ collect_trial() {
 
       # Wait for aic_engine to discover DummyInsert and spawn the task board.
       # aic_engine spawns task_board+cable AFTER accepting the InsertCable goal,
-      # so task_board TF frames only appear after this event.
+      # so task_board TF frames only appear after this event. The relay is already
+      # subscribed, so it will receive the TRANSIENT_LOCAL publish in real time.
       echo "    Watching for task board spawn in container logs (60s max)..."
       SPAWN_ELAPSED=0
       SPAWN_DONE=false
@@ -268,19 +285,6 @@ collect_trial() {
       if ! $SPAWN_DONE; then
         echo "  DIAG: WARNING — no spawn event detected in 60s, proceeding anyway"
       fi
-
-      # Start tf_static_relay inside the container now that the task board exists.
-      # /tf_static uses TRANSIENT_LOCAL QoS; Zenoh does not bridge TRANSIENT_LOCAL
-      # across the container boundary, so the relay must run inside the container
-      # where it can receive all cached static transforms. It re-publishes them to
-      # /tf (RELIABLE) at 2 Hz, which Zenoh does bridge to the host.
-      tmux new-session -d -s aic_collect_relay -x 220 -y 50
-      tmux send-keys -t aic_collect_relay:0 \
-        "docker exec aic_eval bash -c \
-          'source /ws_aic/install/setup.bash && \
-           python3 ${AIC_DIR}/scripts/tf_static_relay.py'" Enter
-      echo "    Waiting 15s for relay to cache and publish task_board frames..."
-      sleep 15
 
       # Wait up to 60 s for TF frames to appear on host via the relay.
       # Extended from 30s: task board spawns after aic_engine discovers DummyInsert,
