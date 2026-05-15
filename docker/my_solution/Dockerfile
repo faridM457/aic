@@ -19,15 +19,11 @@ SHELL ["/bin/bash", "-c"]
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
     cd /ws_aic/src/aic && pixi install --locked
 
-# ACT checkpoint — staged by build_and_submit.sh before docker build.
-# CableInsertion.py reads ACT_MODEL_PATH at startup.
-# Layout expected:  aic_example_policies/checkpoints/
-#                     config.json
-#                     model.safetensors
-#                     policy_preprocessor_step_3_normalizer_processor.safetensors
-# For per-connector models set ACT_MODEL_PATH_SFP / ACT_MODEL_PATH_SC instead.
+# ACT checkpoints are staged by build_and_submit.sh before docker build.
 COPY aic_example_policies/checkpoints /ws_aic/src/aic/aic_example_policies/checkpoints
-ENV ACT_MODEL_PATH=/ws_aic/src/aic/aic_example_policies/checkpoints
+ENV ACT_MODEL_PATH_SFP=/ws_aic/src/aic/aic_example_policies/checkpoints/sfp \
+    ACT_MODEL_PATH_SC=/ws_aic/src/aic/aic_example_policies/checkpoints/sc \
+    ACT_MODEL_PATH=/ws_aic/src/aic/aic_example_policies/checkpoints/sfp
 
 WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh

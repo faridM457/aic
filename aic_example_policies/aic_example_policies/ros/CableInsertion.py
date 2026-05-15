@@ -18,34 +18,41 @@ Execution phases:
 
 import os
 import time
-import numpy as np
-import cv2
 from typing import Optional
 
+import numpy as np
 from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
+from aic_model_interfaces.msg import Observation
+from aic_task_interfaces.msg import Task
+from geometry_msgs.msg import Twist, Vector3, Wrench
+from std_msgs.msg import Header
+
 from aic_model.policy import (
     GetObservationCallback,
     MoveRobotCallback,
     Policy,
     SendFeedbackCallback,
 )
-from aic_model_interfaces.msg import Observation
-from aic_task_interfaces.msg import Task
-from geometry_msgs.msg import Twist, Vector3, Wrench
-from std_msgs.msg import Header
 
 try:
-    import torch
-    import draccus
     import json
     from pathlib import Path
-    from lerobot.policies.act.modeling_act import ACTPolicy
+
+    import draccus
+    import torch
     from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.modeling_act import ACTPolicy
     from safetensors.torch import load_file as safetensors_load
 
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
+
+
+def _cv2():
+    import cv2
+
+    return cv2
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +157,7 @@ class ObservationParser:
             img_msg.height, img_msg.width, 3
         )
         if scale != 1.0:
+            cv2 = _cv2()
             h = max(1, int(img_msg.height * scale))
             w = max(1, int(img_msg.width * scale))
             arr = cv2.resize(arr, (w, h), interpolation=cv2.INTER_AREA)
@@ -205,6 +213,7 @@ class CameraConfidenceScorer:
     def score_image(self, img: np.ndarray) -> float:
         if img is None or img.size == 0:
             return 0.0
+        cv2 = _cv2()
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
         score = (
             self.SHARPNESS_WEIGHT * self._laplacian_sharpness(gray)
@@ -219,10 +228,12 @@ class CameraConfidenceScorer:
         return any(v >= self.LOW_CONFIDENCE_THRESHOLD for v in scores.values())
 
     def _laplacian_sharpness(self, gray: np.ndarray) -> float:
+        cv2 = _cv2()
         lap = cv2.Laplacian(gray, cv2.CV_32F)
         return min(float(lap.var()) / self.SHARPNESS_SAT, 1.0)
 
     def _edge_density(self, gray: np.ndarray) -> float:
+        cv2 = _cv2()
         edges = cv2.Canny(gray.astype(np.uint8), threshold1=50, threshold2=150)
         return min(float(edges.mean()) / self.EDGE_SAT, 1.0)
 

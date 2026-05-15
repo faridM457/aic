@@ -1,132 +1,55 @@
-# ACT training recipe — AIC cable insertion
-# ==========================================
-# Usage (run from ws_aic/src/aic/ inside the pixi environment):
+# ACT training recipe for LeRobot 0.5.1.
 #
-#   pixi run lerobot-train \
-#     --dataset.repo_id=YOUR_HF_HANDLE/aic_cable_insertion_demos \
-#     --policy.type=act \
-#     --policy.chunk_size=25 \
-#     --policy.loss_type=l1 \
-#     --training.batch_size=8 \
-#     --training.num_epochs=100 \
-#     --output_dir=outputs/act_cable_insertion
+# This file is parsed directly by:
+#   pixi run lerobot-train --config_path aic_example_policies/configs/act_cable_insertion.yaml
 #
-# After training, point the policy at your checkpoint:
-#
-#   export ACT_MODEL_PATH=/path/to/outputs/act_cable_insertion/checkpoints/last
-#   # OR set CableInsertion.MODEL_REPO_ID = "YOUR_HF_HANDLE/aic_cable_insertion_act"
-#
-# Prerequisites
-# -------------
-#   1. Record demos with CheatCode (ground_truth:=true required):
-#        pixi run lerobot-record \
-#          --robot.type=aic_controller \
-#          --robot.id=aic \
-#          --dataset.repo_id=YOUR_HF_HANDLE/aic_cable_insertion_demos \
-#          --dataset.single_task="Insert cable into port" \
-#          --dataset.num_episodes=50
-#      Repeat for all 3 trial types (~50 demos each = 150 total).
-#   2. Verify the dataset on HuggingFace Hub before training.
-#   3. Update dataset.repo_id below.
+# Keep field names aligned with:
+#   lerobot.configs.train.TrainPipelineConfig
+#   lerobot.policies.act.configuration_act.ACTConfig
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 dataset:
-  repo_id: YOUR_HF_HANDLE/aic_cable_insertion_demos  # FILL IN after lerobot-record
-
+  repo_id: local/aic-t1-demos
   image_transforms:
     enable: true
-    # FACTR-style visual corruption — applied to camera images during training only.
-    # Force/wrench and state inputs (observation.state, wrist_wrench) are never augmented.
-    # Each augmentation is sampled independently per image per training step.
+    max_num_transforms: 3
+    random_order: true
+    tfs:
+      brightness:
+        weight: 1.0
+        type: ColorJitter
+        kwargs:
+          brightness: [0.7, 1.3]
+      gaussian_blur:
+        weight: 1.0
+        type: GaussianBlur
+        kwargs:
+          kernel_size: 5
+          sigma: [0.1, 2.0]
+      random_erasing:
+        weight: 0.4
+        type: RandomErasing
+        kwargs:
+          p: 0.2
+          scale: [0.1, 0.2]
+          ratio: [0.3, 3.3]
+          value: 0
 
-    # Random Gaussian blur: simulates motion blur and camera defocus.
-    gaussian_blur:
-      p: 0.5            # applied 50% of the time
-      sigma: [0.0, 2.0] # sigma uniformly sampled in [0, 2] pixels
-      kernel_size: 5    # must be odd; 5px covers ±2σ for σ≤2
-
-    # Random brightness shift: ±30% multiplicative factor on pixel values.
-    brightness_jitter:
-      p: 0.5            # applied 50% of the time
-      factor: 0.30      # brightness multiplied by Uniform[0.70, 1.30]
-
-    # Random partial occlusion: black rectangle covering 10–20% of image area.
-    random_erasing:
-      p: 0.20           # applied 20% of the time
-      scale: [0.10, 0.20]  # occluded area as fraction of total image area
-      value: 0          # fill with black (zeros)
-      ratio: [0.3, 3.3] # aspect ratio range for the erased rectangle
-
-    # Occasional full camera dropout: replace entire image tensor with zeros.
-    # Sampled per-camera per-frame independently (each camera drawn separately).
-    camera_dropout:
-      p: 0.05           # 5% probability per camera per frame
-
-# ---------------------------------------------------------------------------
-# Policy: ACT (Action Chunking with Transformers)
-# ---------------------------------------------------------------------------
 policy:
   type: act
 
-  # --- Chunking ---
-  # Must match CableInsertion.ACT_CHUNK_SIZE = 25.
-  # Rationale: RoCo Challenge (2024) found chunk 50->20 improved precision
-  # insertion; 25 is a balanced default. Decrease to 10-15 if the policy
-  # overshoots during the final 5 mm -- more frequent re-planning helps.
+  # Must match CableInsertion.ACT_CHUNK_SIZE.
   chunk_size: 25
   n_action_steps: 25
 
-  # --- Loss function ---
-  # Must match CableInsertion.TRAINING_LOSS = "l1".
-  # L1 (MAE) keeps a constant gradient all the way to zero error, preventing
-  # the "lazy robot" failure mode where L2 loss decays near the target and
-  # the policy stops correcting sub-mm offsets.
-  loss_type: l1
+  # LeRobot 0.5.1 infers input_features/output_features from dataset metadata.
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ACTION: MEAN_STD
 
-  # --- Observation spaces ---
-  # Shapes must match what lerobot-record captured.
-  # Images are resized by IMAGE_SCALE = 0.25 inside CableInsertion.
-  # Basler cameras are 1152×1024; after 0.25× scale the model sees 288×256 (W×H).
-  # Verify with: pixi run lerobot-visualize-dataset --dataset.repo_id=...
-  input_shapes:
-    observation.images.left_camera:   [3, 256, 288]   # [C, H, W] — 1024×1152 Basler cameras × 0.25 scale
-    observation.images.center_camera: [3, 256, 288]
-    observation.images.right_camera:  [3, 256, 288]
-    # 26-D proprioceptive state -- layout defined in ObservationParser.state_vector():
-    #   [0:3]   TCP position (x, y, z)
-    #   [3:7]   TCP orientation (qx, qy, qz, qw)
-    #   [7:10]  TCP linear velocity (vx, vy, vz)
-    #   [10:13] TCP angular velocity (wx, wy, wz)
-    #   [13:19] TCP error (6-DOF pose error)
-    #   [19:26] Joint positions (7 joints)
-    observation.state: [26]
-
-  # --- Action space ---
-  # 7-D Cartesian velocity: [vx, vy, vz, wx, wy, wz, unused]
-  # Recorded from CheatCode's MotionUpdate.velocity field.
-  output_shapes:
-    action: [7]
-
-  # --- Normalization ---
-  # mean_std on all channels -- matches RunACT.prepare_observations() exactly.
-  # Stats are computed from the dataset and saved in the checkpoint as
-  # policy_preprocessor_step_3_normalizer_processor.safetensors.
-  input_normalization_modes:
-    observation.images.left_camera:   mean_std
-    observation.images.center_camera: mean_std
-    observation.images.right_camera:  mean_std
-    observation.state:                mean_std
-  output_normalization_modes:
-    action: mean_std
-
-  # --- Vision backbone ---
   vision_backbone: resnet18
   pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
   replace_final_stride_with_dilation: false
-
-  # --- Transformer architecture (ACT defaults) ---
   pre_norm: false
   dim_model: 512
   n_heads: 8
@@ -134,66 +57,32 @@ policy:
   feedforward_activation: relu
   n_encoder_layers: 4
   n_decoder_layers: 1
-
-  # --- VAE (standard ACT -- do not change unless you know why) ---
   use_vae: true
   latent_dim: 32
   n_vae_encoder_layers: 4
-  kl_weight: 10.0  # Weight on VAE KL-divergence term; increase if latent collapses
+  kl_weight: 10.0
   dropout: 0.1
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-training:
-  # Sizing guidance:
-  #   ~150 demos x ~200 frames/demo = 30 000 frames total.
-  #   batch_size=8 -> ~3 750 steps/epoch.
-  #   100 epochs -> ~375 000 gradient steps. Typical ACT convergence: 50-80 epochs.
-  num_epochs: 100
-  batch_size: 8
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 1.0e-4
 
-  # Learning rates -- ACT standard values.
-  # If loss spikes after epoch 10, halve both lr values.
-  lr: 1.0e-5
-  lr_backbone: 1.0e-5
-  weight_decay: 1.0e-4
-  grad_clip_norm: 10.0
+  device: cuda
+  push_to_hub: false
 
-  online_steps: 0  # Pure offline; RL fine-tuning is handled separately.
+output_dir: outputs/act_trial1
+job_name: aic_act
+batch_size: 8
+steps: 100000
+save_freq: 10000
+eval_freq: 20000
+log_freq: 200
+num_workers: 4
 
-  # Action chunk timestamps.
-  # lerobot-record captures at 20 Hz (aic_adapter publishes at 20 Hz).
-  # chunk_size=25 steps x 0.05 s/step = 1.25 s prediction horizon.
-  delta_timestamps:
-    observation.images.left_camera:   [0.0]
-    observation.images.center_camera: [0.0]
-    observation.images.right_camera:  [0.0]
-    observation.state:                [0.0]
-    action: [0.00, 0.05, 0.10, 0.15, 0.20,
-             0.25, 0.30, 0.35, 0.40, 0.45,
-             0.50, 0.55, 0.60, 0.65, 0.70,
-             0.75, 0.80, 0.85, 0.90, 0.95,
-             1.00, 1.05, 1.10, 1.15, 1.20]  # 25 values
-
-# ---------------------------------------------------------------------------
-# Evaluation (during training)
-# ---------------------------------------------------------------------------
 eval:
   n_episodes: 5
   batch_size: 5
   use_async_envs: false
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 wandb:
   enable: false
-  # Enable with: --wandb.enable=true --wandb.project=aic_cable_insertion --wandb.entity=YOUR_ENTITY
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-checkpoint:
-  save_freq: 10     # Save every 10 epochs; inspect loss curve to pick best.
-  keep_last_n: 3    # Keep only the 3 most recent to save disk space.

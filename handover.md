@@ -29,7 +29,7 @@ task board using a UR5e robot + Robotiq Hand-E gripper + ATI AXIA80-M20 F/T sens
   `aic_controller`.
 - F/T sensor tares successfully.
 - lerobot-record starts on the host (`pixi run lerobot-record …`).
-- `/tf` topic IS bridged from container to host via zenoh.
+- `/scoring/tf` topic IS bridged from container to host via zenoh.
 - ROS service topics (controller_manager, etc.) ARE bridged.
 
 ---
@@ -38,25 +38,12 @@ task board using a UR5e robot + Robotiq Hand-E gripper + ATI AXIA80-M20 F/T sens
 
 ### TF frame visibility
 
-`/tf_static` uses `TRANSIENT_LOCAL` QoS.  Zenoh does **not** bridge
-`TRANSIENT_LOCAL` topics across the container/host boundary despite
-`--network host`.  Consequently:
-
-- `base_link` (dynamic, on `/tf`) **is** visible from the host.
-- `task_board/nic_card_mount_0/sfp_port_0_link` (static, on `/tf_static`)
-  **is NOT** visible from the host.
-
-The `aic_cheatcode` teleop calls `tf2_buffer.lookup_transform("base_link",
-port_frame)` on the host.  Without the task_board frames it stays in `WAIT`
-phase, sends zero velocity, and times out after 180 s — no demos are recorded.
-
-### Fix implemented (current HEAD)
-
-`scripts/tf_static_relay.py` — runs **inside** the eval container via
-`docker exec`.  Subscribes to `/tf_static` with `TRANSIENT_LOCAL` QoS (gets
-all cached frames immediately), then re-publishes every cached transform to
-`/tf` (RELIABLE) at 2 Hz.  Since `/tf` IS bridged, task_board frames now
-appear in the host tf2_ros buffer, and `aic_cheatcode` leaves `WAIT` phase.
+`/tf_static` uses `TRANSIENT_LOCAL` QoS and is not reliable across the
+container/host Zenoh boundary.  The eval container also publishes ground-truth
+task-board frames on `/scoring/tf`, which is host-visible.  The
+`aic_cheatcode` teleop subscribes to `/scoring/tf` and feeds those transforms
+into its local tf2 buffer with `set_transform()`, so it can resolve
+`base_link -> task_board/...` without a relay.
 
 ---
 
@@ -64,9 +51,8 @@ appear in the host tf2_ros buffer, and `aic_cheatcode` leaves `WAIT` phase.
 
 ```
 Pane 1  docker run aic_eval        Gazebo + aic_engine (inside container)
-Pane 2  docker exec → tf_static_relay.py   bridges /tf_static→/tf (inside container)
-Pane 3  pixi run aic_model DummyInsert     holds InsertCable action open (host)
-Pane 4  pixi run lerobot-record            aic_cheatcode teleop drives + records (host)
+Pane 2  pixi run aic_model DummyInsert     holds InsertCable action open (host)
+Pane 3  pixi run lerobot-record            aic_cheatcode teleop drives + records (host)
 ```
 
 **Why DummyInsert?** `aic_engine` sends an `InsertCable` ROS action goal and
@@ -91,7 +77,6 @@ requires a teleop to generate the action side of `(observation, action)` pairs.
 | File | Purpose |
 |------|---------|
 | `scripts/collect_demos.sh` | Main collection script — edit here |
-| `scripts/tf_static_relay.py` | NEW — tf_static→tf bridge (runs inside container) |
 | `scripts/verify_env.sh` | Pre-flight checks (WaveArm + CheatCode) |
 | `scripts/smoke_test.sh` | Quick ROS communication check |
 | `scripts/aws_setup.sh` | One-shot EC2 setup |
@@ -111,15 +96,12 @@ requires a teleop to generate the action side of `(observation, action)` pairs.
 t+0s    docker rm -f aic_eval (cleanup)
 t+0s    docker run aic_eval (Pane 1) — Gazebo + aic_engine start
 t+45s   Diagnostics: container UP, aic_controller UP, GPU check, Gazebo procs
-t+45s   TF_TARGET set (trial-specific port frame)
-t+45s   docker exec tf_static_relay.py (Pane 2) — sleep 5
-t+50s   pixi run aic_model DummyInsert (Pane 3) — sleep 5
-t+55s   30s TF polling loop — waits for Translation: from host tf2_echo
-t+55–85s  TF available (relay working) or WARNING if not
-t+85s   tare_sensor
-t+85s   pixi run lerobot-record (Pane 4)
-t+95s   pgrep check — lerobot-record startup verified
-t+110s  sleep 15 → motion diagnostic (ros2 topic hz /aic_controller/motion_update)
+t+45s   pixi run aic_model DummyInsert (Pane 2) — sleep 5
+t+50s   tare_sensor
+t+50s   pixi run lerobot-record (Pane 3)
+t+60s   pgrep check — lerobot-record startup verified
+t+60s   node check — /aic_cheatcode_teleop should be visible
+t+75s   sleep 15 → motion diagnostic (ros2 topic hz /aic_controller/pose_commands)
 t+110s  wait_for_flag 180s — waits for /tmp/aic_cheatcode_done
         → done: tmux send-keys Right + xdotool key Right → episode saved
 ```
@@ -128,44 +110,35 @@ t+110s  wait_for_flag 180s — waits for /tmp/aic_cheatcode_done
 
 ## What Has NOT Been Tested Yet
 
-The tf_static_relay approach is the current best hypothesis.  **It has not been
-run end-to-end on EC2 yet** (this session was code-only).  The first run will
-tell you:
+The first EC2 run after pulling should tell you:
 
-1. Does the relay start cleanly inside the container?
-   - Check Pane 2 tmux output: should see `caching N static frames`.
-2. Does the 30s TF poll succeed (shows `Translation:`)?
-   - If yes: relay is working.
-   - If no after 30s: task_board transforms may not yet be on `/tf_static` when
-     the relay starts (aic_engine may not have spawned the objects yet).
-     **Fix**: increase the Gazebo wait from 45s to 60–75s, or increase the TF
-     poll loop from 30s to 60s.
-3. Does `aic_cheatcode` leave WAIT phase and show APPROACH in lerobot-record output?
-4. Does the motion diagnostic show `average rate: X.X` > 0?
-5. Does `/tmp/aic_cheatcode_done` get written and the episode save?
+1. Does `/aic_cheatcode_teleop` appear after `lerobot-record` starts?
+2. Does `aic_cheatcode` leave WAIT phase and show APPROACH in lerobot-record output?
+3. Does `/aic_controller/pose_commands` show `average rate: X.X` > 0?
+4. Does `/tmp/aic_cheatcode_done` get written and the episode save?
 
 ---
 
 ## If the Relay Still Doesn't Work
 
-### Option A — Increase timing
-The task_board spawns after `aic_engine` receives the config.  If the relay
-starts before the task_board exists in the simulation, `/tf_static` may not yet
-have those frames.  Try increasing the Gazebo wait (`sleep 45` → `sleep 60`) and
-the TF poll limit (`30` → `60`).
+### Option A — Check `/scoring/tf`
+On the host:
+```bash
+pixi run ros2 topic hz /scoring/tf
+pixi run ros2 topic echo /scoring/tf --once | grep child_frame_id
+```
 
-### Option B — Check relay is receiving frames
-Add inside the container (manually via `docker exec aic_eval bash`):
+Inside the container:
 ```bash
 source /ws_aic/install/setup.bash
-ros2 topic echo /tf_static --once 2>/dev/null | grep child_frame_id
+ros2 topic echo /scoring/tf --once 2>/dev/null | grep child_frame_id
 ```
-If task_board frames appear here, the relay will work.
-If they don't appear, the ground_truth plugin hasn't spawned the objects yet —
-timing issue, see Option A.
+If task_board frames appear in the container but not on the host, the issue is
+Zenoh bridging.  If they do not appear in the container, the ground_truth plugin
+or scene spawn is not ready yet.
 
-### Option C — Static republish from config
-If relay never works, parse the config YAML for the rail position, compute the
+### Option B — Static republish from config
+If `/scoring/tf` is unavailable, parse the config YAML for the rail position, compute the
 port pose analytically, and use `ros2 run tf2_ros static_transform_publisher`
 on the host to inject the frame directly.  This bypasses zenoh entirely.
 

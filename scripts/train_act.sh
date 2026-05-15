@@ -32,15 +32,14 @@ esac
 
 echo "[$(date)] Training Trial ${TRIAL} from dataset: ${REPO}"
 echo "Output: outputs/act_trial${TRIAL}/"
-echo "If CUDA OOM: Ctrl+C and re-run adding:  training.batch_size=4"
+echo "If CUDA OOM: Ctrl+C and re-run adding:  --batch_size=4"
 echo ""
 
 pixi run lerobot-train \
-  --config-path aic_example_policies/configs \
-  --config-name act_cable_insertion \
-  dataset.repo_id="${REPO}" \
-  output_dir="outputs/act_trial${TRIAL}" \
-  policy.device=cuda
+  --config_path aic_example_policies/configs/act_cable_insertion.yaml \
+  --dataset.repo_id="${REPO}" \
+  --output_dir="outputs/act_trial${TRIAL}" \
+  --policy.device=cuda
 
 echo ""
 echo "[$(date)] Trial ${TRIAL} training complete."

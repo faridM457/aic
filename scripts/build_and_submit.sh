@@ -76,17 +76,17 @@ else
   cp -r "${SFP_SRC}/." aic_example_policies/checkpoints/sc/
 fi
 
-# Patch Dockerfile ENV to point to per-connector checkpoint dirs.
-# Back up once; subsequent runs overwrite the same backup.
+# Verify Dockerfile points to per-connector checkpoint dirs.
 DOCKERFILE="docker/my_solution/Dockerfile"
-cp -n "$DOCKERFILE" "${DOCKERFILE}.bak" 2>/dev/null || true
-
-# Replace or append per-connector ENV lines
-sed -i.tmp \
-  -e 's|^ENV ACT_MODEL_PATH=.*|ENV ACT_MODEL_PATH_SFP=/ws_aic/src/aic/aic_example_policies/checkpoints/sfp \\\n    ACT_MODEL_PATH_SC=/ws_aic/src/aic/aic_example_policies/checkpoints/sc|' \
-  "$DOCKERFILE"
-rm -f "${DOCKERFILE}.tmp"
-echo "  Dockerfile ENV updated for per-connector model paths."
+if ! grep -q "ACT_MODEL_PATH_SFP=/ws_aic/src/aic/aic_example_policies/checkpoints/sfp" "$DOCKERFILE"; then
+  echo "ERROR: $DOCKERFILE is missing ACT_MODEL_PATH_SFP."
+  exit 1
+fi
+if ! grep -q "ACT_MODEL_PATH_SC=/ws_aic/src/aic/aic_example_policies/checkpoints/sc" "$DOCKERFILE"; then
+  echo "ERROR: $DOCKERFILE is missing ACT_MODEL_PATH_SC."
+  exit 1
+fi
+echo "  Dockerfile ENV verified for per-connector model paths."
 
 # Verify checkpoint files are present
 for SUBDIR in sfp sc; do

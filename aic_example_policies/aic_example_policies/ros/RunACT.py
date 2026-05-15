@@ -18,16 +18,25 @@ import os
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-import time
 import json
-import torch
-import numpy as np
-import cv2
-import draccus
+import time
 from pathlib import Path
-from typing import Callable, Dict, Any, List
+from typing import Any, Callable, Dict, List
+
+import draccus
+import numpy as np
+import torch
+from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
+from aic_model_interfaces.msg import Observation
+from aic_task_interfaces.msg import Task
+from geometry_msgs.msg import Twist, Vector3, Wrench
+from huggingface_hub import snapshot_download
+from lerobot.policies.act.configuration_act import ACTConfig
+
+# LeRobot & Safetensors
+from lerobot.policies.act.modeling_act import ACTPolicy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Vector3
+from safetensors.torch import load_file
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -35,20 +44,12 @@ from aic_model.policy import (
     Policy,
     SendFeedbackCallback,
 )
-from aic_model_interfaces.msg import Observation
-from aic_task_interfaces.msg import Task
 
-from aic_control_interfaces.msg import (
-    MotionUpdate,
-    TrajectoryGenerationMode,
-)
-from geometry_msgs.msg import Wrench
 
-# LeRobot & Safetensors
-from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.policies.act.configuration_act import ACTConfig
-from safetensors.torch import load_file
-from huggingface_hub import snapshot_download
+def _cv2():
+    import cv2
+
+    return cv2
 
 
 class RunACT(Policy):
@@ -148,6 +149,7 @@ class RunACT(Policy):
 
         # 2. Resize
         if scale != 1.0:
+            cv2 = _cv2()
             img_np = cv2.resize(
                 img_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
             )
