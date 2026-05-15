@@ -241,11 +241,17 @@ collect_trial() {
       # lerobot-record on the host with aic_cheatcode teleop.
       # AICCheatCodeTeleop subscribes to /scoring/tf (RELIABLE, Zenoh-bridged)
       # and feeds task_board transforms into its tf2 buffer via set_transform().
+      LOCAL_DS_ROOT="${HF_LEROBOT_HOME:-$HOME/.cache/huggingface/lerobot}/${DATASET}"
+      REC_RESUME_ARG=""
+      if [ -f "$LOCAL_DS_ROOT/meta/info.json" ]; then
+        REC_RESUME_ARG="--resume=true"
+        echo "  DIAG: Resuming existing LeRobot dataset at $LOCAL_DS_ROOT"
+      fi
       > "$REC_LOG"
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
       tmux pipe-pane -t aic_collect_rec:0 -o "cat >> $REC_LOG"
       tmux send-keys -t aic_collect_rec:0 \
-        "cd $AIC_DIR && pixi run lerobot-record \
+        "cd $AIC_DIR && PYTHONUNBUFFERED=1 pixi run lerobot-record \
            --robot.type=aic_controller \
            --robot.id=aic \
            --robot.teleop_target_mode=cartesian \
@@ -257,25 +263,46 @@ collect_trial() {
            --dataset.single_task='${TASK_DESC}' \
            --dataset.num_episodes=1 \
            --dataset.push_to_hub=false \
+           ${REC_RESUME_ARG} \
            --play_sounds=false" Enter
 
-      # Verify lerobot-record started — give it 10s to initialize
-      sleep 10
-      if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
-        echo "  ERROR: lerobot-record failed to start (attempt $ATTEMPT) — retrying"
+      # Verify lerobot-record reaches teleop.connect(). LeRobot creates the
+      # aic_cheatcode_teleop node only after dataset setup and robot.connect().
+      echo "  DIAG: Waiting up to 90s for aic_cheatcode_teleop node..."
+      TELEOP_NODE_CHECK=""
+      ROBOT_NODE_CHECK=""
+      for _ in $(seq 1 18); do
+        if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
+          echo "  ERROR: lerobot-record exited during startup (attempt $ATTEMPT) — retrying"
+          echo "  DIAG: lerobot-record log tail:"
+          tail -80 "$REC_LOG" 2>/dev/null || true
+          kill_sessions
+          sleep 3
+          continue 2
+        fi
+        NODE_LIST=$(pixi run ros2 node list 2>/dev/null || true)
+        TELEOP_NODE_CHECK=$(echo "$NODE_LIST" | grep -x "/aic_cheatcode_teleop" || true)
+        ROBOT_NODE_CHECK=$(echo "$NODE_LIST" | grep -x "/aic_robot_node" || true)
+        if [ -n "$TELEOP_NODE_CHECK" ]; then
+          break
+        fi
+        sleep 5
+      done
+
+      echo "  DIAG: lerobot-record UP"
+      [ -n "$ROBOT_NODE_CHECK" ] && echo "  DIAG: aic_robot_node UP" || echo "  DIAG: aic_robot_node MISSING"
+      if [ -z "$TELEOP_NODE_CHECK" ]; then
+        echo "  DIAG: aic_cheatcode_teleop node MISSING"
+        echo "  DIAG: ROS nodes:"
+        pixi run ros2 node list 2>/dev/null || true
+        echo "  DIAG: lerobot-record log tail:"
+        tail -80 "$REC_LOG" 2>/dev/null || true
+        echo "  ERROR: lerobot-record did not reach teleop.connect() — retrying"
         kill_sessions
         sleep 3
         continue
       fi
-      echo "  DIAG: lerobot-record UP"
-      TELEOP_NODE_CHECK=$(pixi run ros2 node list 2>/dev/null | grep -x "/aic_cheatcode_teleop" || true)
-      if [ -n "$TELEOP_NODE_CHECK" ]; then
-        echo "  DIAG: aic_cheatcode_teleop node UP"
-      else
-        echo "  DIAG: aic_cheatcode_teleop node MISSING"
-        echo "  DIAG: lerobot-record log tail:"
-        tail -40 "$REC_LOG" 2>/dev/null || true
-      fi
+      echo "  DIAG: aic_cheatcode_teleop node UP"
 
       # Wait 15s then verify motion commands are being sent.
       # If aic_cheatcode sees TF it leaves WAIT phase and publishes to pose_commands.
