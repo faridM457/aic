@@ -16,6 +16,7 @@
 
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, cast
@@ -33,6 +34,7 @@ from lerobot_teleoperator_devices import KeyboardJointTeleop, KeyboardJointTeleo
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.time import Time as RosTime
+from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformListener
 
@@ -377,13 +379,16 @@ class AICCheatCodeTeleopConfig(TeleoperatorConfig):
     target_port_frame: str = ""    # overrides trial_type when set
     cable_tip_frame: str = ""      # overrides trial_type when set
 
-    approach_z_offset: float = 0.15    # m above port for the approach hover point
+    approach_z_offset: float = 0.12    # m above port for the approach hover point
     approach_gain: float = 2.5         # P-gain: vel = gain * position_error
     approach_threshold: float = 0.012  # m: switch to DESCEND when error < this
-    descent_speed: float = 0.002       # m/s downward (base_link +Z is up)
-    lateral_gain: float = 3.0          # P-gain for XY correction during descent
-    max_depth_m: float = 0.032         # m: declare insertion done when depth reaches this
-    max_speed: float = 0.08            # m/s: hard clip on all velocity components
+    lateral_gain: float = 4.0          # P-gain for XY correction during descent
+    descent_gain: float = 1.5          # P-gain for Z insertion target
+    angular_gain: float = 2.0          # P-gain for plug-to-port orientation error
+    insertion_depth_m: float = 0.006   # m below port frame used as final depth target
+    done_xy_threshold: float = 0.007   # m: allow done when tip is centered at depth
+    max_speed: float = 0.10            # m/s: hard clip on linear velocity components
+    max_angular_speed: float = 0.5     # rad/s: hard clip on angular velocity components
     done_flag_path: str = "/tmp/aic_cheatcode_done"  # written when episode is complete
 
 
@@ -424,12 +429,15 @@ class AICCheatCodeTeleop(Teleoperator):
         self._node = None
         self._tf_buffer: Buffer | None = None
         self._scoring_tf_sub = None
+        self._insertion_event_sub = None
         self._executor = None
         self._executor_thread: Thread | None = None
 
         self._phase: str = "WAIT"
         self._approach_target: tuple[float, float, float] | None = None
-        self._descent_start_z: float | None = None
+        self._phase_started_at: float = time.monotonic()
+        self._insertion_event_seen: bool = False
+        self._last_status_log: float = 0.0
 
         self._zero: MotionUpdateActionDict = {
             "linear.x": 0.0, "linear.y": 0.0, "linear.z": 0.0,
@@ -472,6 +480,8 @@ class AICCheatCodeTeleop(Teleoperator):
         TransformListener(self._tf_buffer, self._node)
         self._scoring_tf_sub = self._node.create_subscription(
             TFMessage, '/scoring/tf', self._on_scoring_tf, 10)
+        self._insertion_event_sub = self._node.create_subscription(
+            String, "/scoring/insertion_event", self._on_insertion_event, 10)
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._executor_thread = Thread(target=self._executor.spin, daemon=True)
@@ -482,6 +492,7 @@ class AICCheatCodeTeleop(Teleoperator):
         print(
             f"[aic_cheatcode] Connected. Watching TF frames:\n"
             f"  port : {self._port_frame}\n"
+            f"  tip  : {self._tip_frame}\n"
             f"  gripper: gripper/tcp"
         )
 
@@ -496,19 +507,110 @@ class AICCheatCodeTeleop(Teleoperator):
         for transform in msg.transforms:
             self._tf_buffer.set_transform(transform, 'scoring_tf')
 
-    def _lookup_xyz(self, frame: str) -> tuple[float, float, float] | None:
-        """Return (x, y, z) of frame in base_link, or None if unavailable."""
+    def _on_insertion_event(self, msg: String) -> None:
+        event_port = msg.data.strip("/")
+        target_port = self._port_frame.removeprefix("task_board/").removesuffix(
+            "_link"
+        )
+        if event_port.endswith(target_port) or target_port.endswith(event_port):
+            print(f"[aic_cheatcode] Insertion event received: {msg.data}")
+            self._insertion_event_seen = True
+        else:
+            print(f"[aic_cheatcode] Ignoring insertion event for other port: {msg.data}")
+
+    def _lookup_transform(self, frame: str):
         if self._tf_buffer is None:
             return None
         try:
-            tf = self._tf_buffer.lookup_transform("base_link", frame, RosTime())
-            t = tf.transform.translation
-            return (t.x, t.y, t.z)
+            return self._tf_buffer.lookup_transform("base_link", frame, RosTime())
         except Exception:
             return None
 
+    def _lookup_xyz(self, frame: str) -> tuple[float, float, float] | None:
+        """Return (x, y, z) of frame in base_link, or None if unavailable."""
+        tf = self._lookup_transform(frame)
+        if tf is None:
+            return None
+        t = tf.transform.translation
+        return (t.x, t.y, t.z)
+
     def _clip_vel(self, v: float) -> float:
         return float(min(max(v, -self.config.max_speed), self.config.max_speed))
+
+    def _clip_angular(self, v: float) -> float:
+        return float(
+            min(max(v, -self.config.max_angular_speed), self.config.max_angular_speed)
+        )
+
+    @staticmethod
+    def _quat_multiply(
+        a: tuple[float, float, float, float],
+        b: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return (
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        )
+
+    @staticmethod
+    def _quat_inverse(q: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        w, x, y, z = q
+        return (w, -x, -y, -z)
+
+    def _orientation_error(self) -> tuple[float, float, float]:
+        port_tf = self._lookup_transform(self._port_frame)
+        tip_tf = self._lookup_transform(self._tip_frame)
+        if port_tf is None or tip_tf is None:
+            return (0.0, 0.0, 0.0)
+
+        qp_msg = port_tf.transform.rotation
+        qt_msg = tip_tf.transform.rotation
+        q_port = (qp_msg.w, qp_msg.x, qp_msg.y, qp_msg.z)
+        q_tip = (qt_msg.w, qt_msg.x, qt_msg.y, qt_msg.z)
+        q_err = self._quat_multiply(q_port, self._quat_inverse(q_tip))
+        sign = 1.0 if q_err[0] >= 0.0 else -1.0
+        return (
+            2.0 * sign * q_err[1],
+            2.0 * sign * q_err[2],
+            2.0 * sign * q_err[3],
+        )
+
+    def _action(
+        self,
+        linear: tuple[float, float, float],
+        angular_error: tuple[float, float, float] | None = None,
+    ) -> dict[str, Any]:
+        if angular_error is None:
+            angular_error = self._orientation_error()
+        ag = self.config.angular_gain
+        return cast(dict, {
+            "linear.x": self._clip_vel(linear[0]),
+            "linear.y": self._clip_vel(linear[1]),
+            "linear.z": self._clip_vel(linear[2]),
+            "angular.x": self._clip_angular(ag * angular_error[0]),
+            "angular.y": self._clip_angular(ag * angular_error[1]),
+            "angular.z": self._clip_angular(ag * angular_error[2]),
+        })
+
+    def _set_phase(self, phase: str) -> None:
+        self._phase = phase
+        self._phase_started_at = time.monotonic()
+
+    def _write_done_flag(self, reason: str) -> None:
+        if not os.path.exists(self.config.done_flag_path):
+            print(f"[aic_cheatcode] Done: {reason}")
+            with open(self.config.done_flag_path, "w") as fh:
+                fh.write(f"{reason}\n")
+
+    def _log_status(self, message: str, period_s: float = 5.0) -> None:
+        now = time.monotonic()
+        if now - self._last_status_log >= period_s:
+            print(message)
+            self._last_status_log = now
 
     def get_action(self) -> dict[str, Any]:
         if not self._is_connected:
@@ -516,80 +618,88 @@ class AICCheatCodeTeleop(Teleoperator):
 
         cfg = self.config
 
+        if self._insertion_event_seen:
+            self._set_phase("DONE")
+            self._write_done_flag("insertion_event")
+            return cast(dict, self._zero)
+
         # ------------------------------------------------------------------
         # WAIT: poll until TF frames are available
         # ------------------------------------------------------------------
         if self._phase == "WAIT":
             port_xyz = self._lookup_xyz(self._port_frame)
+            tip_xyz = self._lookup_xyz(self._tip_frame)
             tcp_xyz = self._lookup_xyz("gripper/tcp")
-            if port_xyz is None or tcp_xyz is None:
+            if port_xyz is None or tip_xyz is None or tcp_xyz is None:
+                self._log_status(
+                    "[aic_cheatcode] Waiting for TF: "
+                    f"port={port_xyz is not None} tip={tip_xyz is not None} "
+                    f"tcp={tcp_xyz is not None}"
+                )
                 return cast(dict, self._zero)
             self._approach_target = (
                 port_xyz[0],
                 port_xyz[1],
                 port_xyz[2] + cfg.approach_z_offset,
             )
-            self._phase = "APPROACH"
+            self._set_phase("APPROACH")
             print(
-                f"[aic_cheatcode] TF ready — port={port_xyz}  "
-                f"hover_target={self._approach_target}  → APPROACH"
+                f"[aic_cheatcode] TF ready - port={port_xyz} tip={tip_xyz} "
+                f"hover_target={self._approach_target} -> APPROACH"
             )
 
         # ------------------------------------------------------------------
-        # APPROACH: P-controller toward hover point above port
+        # APPROACH: P-controller moves the cable tip, not the gripper TCP, to
+        # a hover point above the target port.
         # ------------------------------------------------------------------
         if self._phase == "APPROACH":
-            tcp_xyz = self._lookup_xyz("gripper/tcp")
-            if tcp_xyz is None or self._approach_target is None:
+            tip_xyz = self._lookup_xyz(self._tip_frame)
+            if tip_xyz is None or self._approach_target is None:
                 return cast(dict, self._zero)
             tgt = self._approach_target
-            ex = tgt[0] - tcp_xyz[0]
-            ey = tgt[1] - tcp_xyz[1]
-            ez = tgt[2] - tcp_xyz[2]
+            ex = tgt[0] - tip_xyz[0]
+            ey = tgt[1] - tip_xyz[1]
+            ez = tgt[2] - tip_xyz[2]
             dist = math.sqrt(ex * ex + ey * ey + ez * ez)
             if dist < cfg.approach_threshold:
-                self._descent_start_z = tcp_xyz[2]
-                self._phase = "DESCEND"
-                print(
-                    f"[aic_cheatcode] Arrived at hover (err={dist*1000:.1f}mm) "
-                    f"start_z={self._descent_start_z:.4f}  → DESCEND"
-                )
+                self._set_phase("DESCEND")
+                print(f"[aic_cheatcode] Arrived at hover (err={dist*1000:.1f}mm) -> DESCEND")
                 return cast(dict, self._zero)
+            self._log_status(
+                f"[aic_cheatcode] APPROACH tip_err={dist*1000:.1f}mm "
+                f"xyz=({ex:.3f},{ey:.3f},{ez:.3f})"
+            )
             g = cfg.approach_gain
-            return cast(dict, {
-                "linear.x": self._clip_vel(g * ex),
-                "linear.y": self._clip_vel(g * ey),
-                "linear.z": self._clip_vel(g * ez),
-                "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
-            })
+            return self._action((g * ex, g * ey, g * ez))
 
         # ------------------------------------------------------------------
-        # DESCEND: constant -Z with XY correction toward port centre
+        # DESCEND: keep the plug tip centered and drive it into the port.
         # ------------------------------------------------------------------
         if self._phase == "DESCEND":
-            tcp_xyz = self._lookup_xyz("gripper/tcp")
+            tip_xyz = self._lookup_xyz(self._tip_frame)
             port_xyz = self._lookup_xyz(self._port_frame)
-            if tcp_xyz is None or port_xyz is None or self._descent_start_z is None:
+            if tip_xyz is None or port_xyz is None:
                 return cast(dict, self._zero)
-            depth = self._descent_start_z - tcp_xyz[2]
-            if depth >= cfg.max_depth_m:
-                self._phase = "DONE"
-                print(
-                    f"[aic_cheatcode] Insertion complete "
-                    f"(depth={depth*1000:.1f}mm ≥ {cfg.max_depth_m*1000:.0f}mm)  → DONE"
+            ex = port_xyz[0] - tip_xyz[0]
+            ey = port_xyz[1] - tip_xyz[1]
+            target_z = port_xyz[2] - cfg.insertion_depth_m
+            ez = target_z - tip_xyz[2]
+            xy_err = math.sqrt(ex * ex + ey * ey)
+            if xy_err <= cfg.done_xy_threshold and tip_xyz[2] <= port_xyz[2]:
+                self._set_phase("DONE")
+                self._write_done_flag(
+                    f"tip_at_port xy={xy_err*1000:.1f}mm z={tip_xyz[2]:.4f}"
                 )
-                with open(cfg.done_flag_path, "w") as fh:
-                    fh.write("done\n")
                 return cast(dict, self._zero)
-            ex = port_xyz[0] - tcp_xyz[0]
-            ey = port_xyz[1] - tcp_xyz[1]
-            g = cfg.lateral_gain
-            return cast(dict, {
-                "linear.x": self._clip_vel(g * ex),
-                "linear.y": self._clip_vel(g * ey),
-                "linear.z": -cfg.descent_speed,   # negative = descend (base_link +Z up)
-                "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
-            })
+            self._log_status(
+                f"[aic_cheatcode] DESCEND xy={xy_err*1000:.1f}mm "
+                f"z_err={ez*1000:.1f}mm tip_z={tip_xyz[2]:.4f} port_z={port_xyz[2]:.4f}"
+            )
+            return self._action((
+                cfg.lateral_gain * ex,
+                cfg.lateral_gain * ey,
+                cfg.descent_gain * ez,
+            ))
 
         # ------------------------------------------------------------------
         # DONE
@@ -614,5 +724,7 @@ class AICCheatCodeTeleop(Teleoperator):
             os.remove(self.config.done_flag_path)
         self._phase = "WAIT"
         self._approach_target = None
-        self._descent_start_z = None
+        self._phase_started_at = time.monotonic()
+        self._insertion_event_seen = False
+        self._last_status_log = 0.0
         print("[aic_cheatcode] Reset for new episode")
