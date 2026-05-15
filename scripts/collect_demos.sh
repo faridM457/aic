@@ -47,6 +47,7 @@ CONFIG_BASE="$AIC_DIR/aic_example_policies/configs/demo_configs"
 LOG_FILE=~/ws_aic/collection_log.txt
 DONE_FLAG=/tmp/aic_cheatcode_done
 SECONDS_PER_EP=25   # estimated seconds per episode for ETA
+REC_LOG=/tmp/aic_collect_lerobot_record.log
 
 cd "$AIC_DIR"
 
@@ -240,7 +241,9 @@ collect_trial() {
       # lerobot-record on the host with aic_cheatcode teleop.
       # AICCheatCodeTeleop subscribes to /scoring/tf (RELIABLE, Zenoh-bridged)
       # and feeds task_board transforms into its tf2 buffer via set_transform().
+      > "$REC_LOG"
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
+      tmux pipe-pane -t aic_collect_rec:0 -o "cat >> $REC_LOG"
       tmux send-keys -t aic_collect_rec:0 \
         "cd $AIC_DIR && pixi run lerobot-record \
            --robot.type=aic_controller \
@@ -265,11 +268,19 @@ collect_trial() {
         continue
       fi
       echo "  DIAG: lerobot-record UP"
+      TELEOP_NODE_CHECK=$(pixi run ros2 node list 2>/dev/null | grep -x "/aic_cheatcode_teleop" || true)
+      if [ -n "$TELEOP_NODE_CHECK" ]; then
+        echo "  DIAG: aic_cheatcode_teleop node UP"
+      else
+        echo "  DIAG: aic_cheatcode_teleop node MISSING"
+        echo "  DIAG: lerobot-record log tail:"
+        tail -40 "$REC_LOG" 2>/dev/null || true
+      fi
 
       # Wait 15s then verify motion commands are being sent.
-      # If aic_cheatcode sees TF it leaves WAIT phase and publishes to motion_update.
+      # If aic_cheatcode sees TF it leaves WAIT phase and publishes to pose_commands.
       sleep 15
-      MOTION_CHECK=$(timeout 8 pixi run ros2 topic hz /aic_controller/motion_update \
+      MOTION_CHECK=$(timeout 8 pixi run ros2 topic hz /aic_controller/pose_commands \
         --window 5 2>/dev/null | grep "average rate" | head -1 || echo "no data")
       echo "  DIAG: Motion commands: $MOTION_CHECK"
 
