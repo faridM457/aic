@@ -50,10 +50,6 @@ SECONDS_PER_EP=25   # estimated seconds per episode for ETA
 REC_LOG=/tmp/aic_collect_lerobot_record.log
 REC_STATUS=/tmp/aic_collect_lerobot_record.status
 REC_WRAPPER=/tmp/aic_collect_lerobot_record.sh
-# Collection fallback: if the cheatcode is publishing commands but never writes
-# the done flag, still save the episode after this many seconds. This keeps
-# dataset collection moving while preserving the real done-flag path when it works.
-AUTO_SAVE_AFTER_S=${AIC_AUTO_SAVE_AFTER_S:-75}
 
 cd "$AIC_DIR"
 
@@ -86,24 +82,6 @@ wait_for_flag() {
     sleep 2
     elapsed=$((elapsed + 2))
     if [ $elapsed -ge "$timeout_s" ]; then
-      return 1
-    fi
-  done
-  return 0
-}
-
-wait_for_flag_or_autosave() {
-  local timeout_s=$1
-  local autosave_s=$2
-  local elapsed=0
-  while [ ! -f "$DONE_FLAG" ]; do
-    sleep 2
-    elapsed=$((elapsed + 2))
-    if [ "$autosave_s" -gt 0 ] && [ "$elapsed" -ge "$autosave_s" ]; then
-      echo "autosave" > "$DONE_FLAG"
-      return 2
-    fi
-    if [ "$elapsed" -ge "$timeout_s" ]; then
       return 1
     fi
   done
@@ -388,20 +366,9 @@ SH
         --window 5 2>/dev/null | grep "average rate" | head -1 || echo "no data")
       echo "  DIAG: Motion commands: $MOTION_CHECK"
 
-      # Wait for the aic_cheatcode teleop to write its done flag. If the
-      # physical insertion event never arrives, save a bounded motion segment
-      # anyway so collection does not stall indefinitely.
-      echo "    Waiting for insertion to complete (180 s max, autosave ${AUTO_SAVE_AFTER_S}s)..."
-      set +e
-      wait_for_flag_or_autosave 180 "$AUTO_SAVE_AFTER_S"
-      FLAG_RESULT=$?
-      set -e
-      if [ "$FLAG_RESULT" -eq 0 ] || [ "$FLAG_RESULT" -eq 2 ]; then
-        if [ "$FLAG_RESULT" -eq 2 ]; then
-          echo "  DIAG: Autosaving episode after ${AUTO_SAVE_AFTER_S}s without done flag"
-          echo "  DIAG: aic_cheatcode log lines:"
-          grep -E "\[aic_cheatcode\]" "$REC_LOG" 2>/dev/null | tail -80 || true
-        fi
+      # Wait for the aic_cheatcode teleop to write its done flag (180 s max)
+      echo "    Waiting for insertion to complete (180 s max)..."
+      if wait_for_flag 180; then
         # Save the episode: inject Right Arrow into the lerobot-record tmux pane
         # (tmux send-keys covers stdin readers; xdotool covers X11/pynput listeners)
         sleep 1
