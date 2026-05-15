@@ -291,6 +291,7 @@ REC_STATUS="$8"
     --robot.id=aic
     --robot.teleop_target_mode=cartesian
     --robot.teleop_frame_id=base_link
+    --robot.teleop_cartesian_command_mode=position
     --teleop.type=aic_cheatcode
     --teleop.id=aic
     "--teleop.trial_type=${TELEOP_TRIAL}"

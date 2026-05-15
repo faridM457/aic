@@ -33,7 +33,7 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Twist, Vector3, Wrench
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, Wrench
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -48,7 +48,7 @@ from rclpy.subscription import Subscription
 from sensor_msgs.msg import JointState
 
 from .aic_robot import aic_cameras, arm_joint_names
-from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
+from .types import JointMotionUpdateActionDict, MotionUpdateActionDict, PoseMotionUpdateActionDict
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ class CameraImageScaling(TypedDict):
 class AICRobotAICControllerConfig(RobotConfig):
     teleop_target_mode: str = "cartesian"  # "cartesian" or "joint"
     teleop_frame_id: str = "gripper/tcp"  # "gripper/tcp" or "base_link"
+    teleop_cartesian_command_mode: str = "velocity"  # "velocity" or "position"
 
     arm_joint_names: list[str] = field(default_factory=arm_joint_names.copy)
 
@@ -208,8 +209,17 @@ class AICRobotAICController(Robot):
             )
         self.teleop_target_mode = config.teleop_target_mode
 
+        if config.teleop_cartesian_command_mode not in ["velocity", "position"]:
+            raise ValueError(
+                f"Invalid teleop_cartesian_command_mode: "
+                f"'{config.teleop_cartesian_command_mode}'. "
+                "Supported modes are 'velocity' or 'position'."
+            )
+        self.teleop_cartesian_command_mode = config.teleop_cartesian_command_mode
+
         print(f"Teleop frame id: {self.frame_id}")
         print(f"Teleop target mode: {self.teleop_target_mode}")
+        print(f"Teleop Cartesian command mode: {self.teleop_cartesian_command_mode}")
 
     def send_change_control_mode_req(self, mode: int):
         if not self.ros2_interface:
@@ -257,11 +267,11 @@ class AICRobotAICController(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return (
-            MotionUpdateActionDict.__annotations__
-            if self.teleop_target_mode == "cartesian"
-            else JointMotionUpdateActionDict.__annotations__
-        )
+        if self.teleop_target_mode == "joint":
+            return JointMotionUpdateActionDict.__annotations__
+        if self.teleop_cartesian_command_mode == "position":
+            return PoseMotionUpdateActionDict.__annotations__
+        return MotionUpdateActionDict.__annotations__
 
     @property
     def is_connected(self) -> bool:
@@ -384,34 +394,56 @@ class AICRobotAICController(Robot):
         if not self._is_connected or not self.ros2_interface:
             raise DeviceNotConnectedError()
 
-        motion_update_action = cast(MotionUpdateActionDict, action)
-
-        twist_msg = Twist()
-
-        try:
-            twist_msg.linear.x = float(motion_update_action["linear.x"])
-        except KeyError:
-            raise KeyError(
-                "Missing key 'linear.x'. If using `--teleop.type=aic_keyboard_joint`, have you set `--robot.teleop_target_mode=joint`?"
-            ) from None
-        twist_msg.linear.y = float(motion_update_action["linear.y"])
-        twist_msg.linear.z = float(motion_update_action["linear.z"])
-        twist_msg.angular.x = float(motion_update_action["angular.x"])
-        twist_msg.angular.y = float(motion_update_action["angular.y"])
-        twist_msg.angular.z = float(motion_update_action["angular.z"])
-
         msg = MotionUpdate()
         msg.header.stamp = self.ros2_interface.node.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
-        msg.velocity = twist_msg
-        msg.target_stiffness = np.diag([85.0, 85.0, 85.0, 85.0, 85.0, 85.0]).flatten()
-        msg.target_damping = np.diag([75.0, 75.0, 75.0, 75.0, 75.0, 75.0]).flatten()
+        msg.target_stiffness = np.diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0]).flatten()
+        msg.target_damping = np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0]).flatten()
         msg.feedforward_wrench_at_tip = Wrench(
             force=Vector3(x=0.0, y=0.0, z=0.0),
             torque=Vector3(x=0.0, y=0.0, z=0.0),
         )
-        msg.wrench_feedback_gains_at_tip = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
+        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
+
+        if self.teleop_cartesian_command_mode == "position":
+            pose_action = cast(PoseMotionUpdateActionDict, action)
+            try:
+                msg.pose = Pose(
+                    position=Point(
+                        x=float(pose_action["target_position.x"]),
+                        y=float(pose_action["target_position.y"]),
+                        z=float(pose_action["target_position.z"]),
+                    ),
+                    orientation=Quaternion(
+                        x=float(pose_action["target_orientation.x"]),
+                        y=float(pose_action["target_orientation.y"]),
+                        z=float(pose_action["target_orientation.z"]),
+                        w=float(pose_action["target_orientation.w"]),
+                    ),
+                )
+            except KeyError:
+                raise KeyError(
+                    "Missing Cartesian position action key. If using a velocity "
+                    "teleop, set `--robot.teleop_cartesian_command_mode=velocity`."
+                ) from None
+            msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+        else:
+            motion_update_action = cast(MotionUpdateActionDict, action)
+            twist_msg = Twist()
+            try:
+                twist_msg.linear.x = float(motion_update_action["linear.x"])
+            except KeyError:
+                raise KeyError(
+                    "Missing key 'linear.x'. If using `--teleop.type=aic_keyboard_joint`, have you set `--robot.teleop_target_mode=joint`?"
+                ) from None
+            twist_msg.linear.y = float(motion_update_action["linear.y"])
+            twist_msg.linear.z = float(motion_update_action["linear.z"])
+            twist_msg.angular.x = float(motion_update_action["angular.x"])
+            twist_msg.angular.y = float(motion_update_action["angular.y"])
+            twist_msg.angular.z = float(motion_update_action["angular.z"])
+            msg.velocity = twist_msg
+            msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
+
         self.ros2_interface.motion_update_pub.publish(msg)
 
     def send_action_joint(self, action: dict[str, Any]) -> None:

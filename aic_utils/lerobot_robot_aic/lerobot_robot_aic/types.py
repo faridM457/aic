@@ -12,6 +12,19 @@ MotionUpdateActionDict = TypedDict(
     },
 )
 
+PoseMotionUpdateActionDict = TypedDict(
+    "PoseMotionUpdateActionDict",
+    {
+        "target_position.x": float,
+        "target_position.y": float,
+        "target_position.z": float,
+        "target_orientation.x": float,
+        "target_orientation.y": float,
+        "target_orientation.z": float,
+        "target_orientation.w": float,
+    },
+)
+
 JointMotionUpdateActionDict = TypedDict(
     "JointMotionUpdateActionDict",
     {
