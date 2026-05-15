@@ -379,6 +379,10 @@ SH
         break
       else
         echo "    Attempt $ATTEMPT timed out — retrying..."
+        echo "  DIAG: aic_cheatcode log lines:"
+        grep -E "\[aic_cheatcode\]" "$REC_LOG" 2>/dev/null | tail -80 || true
+        echo "  DIAG: lerobot-record log tail:"
+        tail -80 "$REC_LOG" 2>/dev/null || true
         kill_sessions
         sleep 3
       fi

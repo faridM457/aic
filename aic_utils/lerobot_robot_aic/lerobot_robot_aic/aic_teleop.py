@@ -424,6 +424,16 @@ class AICCheatCodeTeleop(Teleoperator):
         defaults = _TRIAL_DEFAULTS.get(config.trial_type, _TRIAL_DEFAULTS["t1"])
         self._port_frame: str = config.target_port_frame or defaults["target_port_frame"]
         self._tip_frame: str = config.cable_tip_frame or defaults["cable_tip_frame"]
+        cable_name = self._tip_frame.split("/", 1)[0]
+        self._tip_frame_candidates: list[str] = [
+            self._tip_frame,
+            f"{cable_name}/link_10",
+            f"{cable_name}/link_9",
+            f"{cable_name}/link_11",
+            f"{cable_name}/link_8",
+            "gripper/tcp",
+        ]
+        self._active_tip_frame: str = self._tip_frame
 
         self._is_connected: bool = False
         self._node = None
@@ -492,7 +502,7 @@ class AICCheatCodeTeleop(Teleoperator):
         print(
             f"[aic_cheatcode] Connected. Watching TF frames:\n"
             f"  port : {self._port_frame}\n"
-            f"  tip  : {self._tip_frame}\n"
+            f"  tip candidates: {', '.join(self._tip_frame_candidates)}\n"
             f"  gripper: gripper/tcp"
         )
 
@@ -534,6 +544,17 @@ class AICCheatCodeTeleop(Teleoperator):
         t = tf.transform.translation
         return (t.x, t.y, t.z)
 
+    def _lookup_tip_xyz(self) -> tuple[float, float, float] | None:
+        for frame in self._tip_frame_candidates:
+            xyz = self._lookup_xyz(frame)
+            if xyz is None:
+                continue
+            if frame != self._active_tip_frame:
+                print(f"[aic_cheatcode] Using tip frame fallback: {frame}")
+                self._active_tip_frame = frame
+            return xyz
+        return None
+
     def _clip_vel(self, v: float) -> float:
         return float(min(max(v, -self.config.max_speed), self.config.max_speed))
 
@@ -563,7 +584,7 @@ class AICCheatCodeTeleop(Teleoperator):
 
     def _orientation_error(self) -> tuple[float, float, float]:
         port_tf = self._lookup_transform(self._port_frame)
-        tip_tf = self._lookup_transform(self._tip_frame)
+        tip_tf = self._lookup_transform(self._active_tip_frame)
         if port_tf is None or tip_tf is None:
             return (0.0, 0.0, 0.0)
 
@@ -628,7 +649,7 @@ class AICCheatCodeTeleop(Teleoperator):
         # ------------------------------------------------------------------
         if self._phase == "WAIT":
             port_xyz = self._lookup_xyz(self._port_frame)
-            tip_xyz = self._lookup_xyz(self._tip_frame)
+            tip_xyz = self._lookup_tip_xyz()
             tcp_xyz = self._lookup_xyz("gripper/tcp")
             if port_xyz is None or tip_xyz is None or tcp_xyz is None:
                 self._log_status(
@@ -653,7 +674,7 @@ class AICCheatCodeTeleop(Teleoperator):
         # a hover point above the target port.
         # ------------------------------------------------------------------
         if self._phase == "APPROACH":
-            tip_xyz = self._lookup_xyz(self._tip_frame)
+            tip_xyz = self._lookup_tip_xyz()
             if tip_xyz is None or self._approach_target is None:
                 return cast(dict, self._zero)
             tgt = self._approach_target
@@ -676,7 +697,7 @@ class AICCheatCodeTeleop(Teleoperator):
         # DESCEND: keep the plug tip centered and drive it into the port.
         # ------------------------------------------------------------------
         if self._phase == "DESCEND":
-            tip_xyz = self._lookup_xyz(self._tip_frame)
+            tip_xyz = self._lookup_tip_xyz()
             port_xyz = self._lookup_xyz(self._port_frame)
             if tip_xyz is None or port_xyz is None:
                 return cast(dict, self._zero)
