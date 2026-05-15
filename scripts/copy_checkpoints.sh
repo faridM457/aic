@@ -23,25 +23,26 @@ SCP="scp -i $KEY -o StrictHostKeyChecking=no"
 echo "Downloading checkpoints from $EC2_HOST ..."
 
 for TRIAL in 1 2 3; do
-  LOCAL_DIR="outputs/act_trial${TRIAL}/checkpoints"
-  REMOTE_DIR="~/ws_aic/src/aic/outputs/act_trial${TRIAL}/checkpoints/best"
+  LOCAL_DIR="outputs/act_trial${TRIAL}/checkpoints/last/pretrained_model"
+  REMOTE_DIR="~/ws_aic/src/aic/outputs/act_trial${TRIAL}/checkpoints/last/pretrained_model"
 
   mkdir -p "$LOCAL_DIR"
 
-  echo "  Trial ${TRIAL}: ${REMOTE_DIR} → ${LOCAL_DIR}/best/"
-  $SCP -r "ubuntu@${EC2_HOST}:${REMOTE_DIR}" "${LOCAL_DIR}/"
+  echo "  Trial ${TRIAL}: ${REMOTE_DIR}/ → ${LOCAL_DIR}/"
+  $SCP -r "ubuntu@${EC2_HOST}:${REMOTE_DIR}/." "${LOCAL_DIR}/"
 
-  if [ ! -d "${LOCAL_DIR}/best" ]; then
+  if [ ! -f "${LOCAL_DIR}/config.json" ] || [ ! -f "${LOCAL_DIR}/model.safetensors" ]; then
     echo "ERROR: Trial ${TRIAL} checkpoint not downloaded. Check EC2 training status."
+    echo "Expected LeRobot 0.5.1 checkpoint files under: ${LOCAL_DIR}/"
     exit 1
   fi
-  echo "  Trial ${TRIAL}: OK ($(ls "${LOCAL_DIR}/best/" | wc -l) files)"
+  echo "  Trial ${TRIAL}: OK ($(ls "${LOCAL_DIR}/" | wc -l) files)"
 done
 
 echo ""
 echo "All checkpoints downloaded:"
-echo "  outputs/act_trial1/checkpoints/best/"
-echo "  outputs/act_trial2/checkpoints/best/"
-echo "  outputs/act_trial3/checkpoints/best/"
+echo "  outputs/act_trial1/checkpoints/last/pretrained_model/"
+echo "  outputs/act_trial2/checkpoints/last/pretrained_model/"
+echo "  outputs/act_trial3/checkpoints/last/pretrained_model/"
 echo ""
 echo "Next: ./scripts/build_and_submit.sh"

@@ -12,7 +12,7 @@
 #   The A10G has 24 GB VRAM — training and collection don't conflict (different
 #   processes). Typical training time: ~2 hours per trial on A10G.
 #
-#   If you hit CUDA OOM:  Ctrl+C and re-run adding:  training.batch_size=4
+#   If you hit CUDA OOM:  Ctrl+C and re-run adding:  --batch_size=4
 #
 # Usage:  ./scripts/train_act.sh <trial_number>
 # Example: ./scripts/train_act.sh 1
@@ -46,6 +46,6 @@ echo "[$(date)] Trial ${TRIAL} training complete."
 echo "Checkpoints:"
 ls "outputs/act_trial${TRIAL}/checkpoints/" 2>/dev/null || echo "(none found)"
 echo ""
-echo "Next: copy the 'best' checkpoint folder."
+echo "Next: copy the latest LeRobot checkpoint."
 echo "  Local (from your laptop): ./scripts/copy_checkpoints.sh <ec2-dns>"
-echo "  Or on EC2: ls outputs/act_trial${TRIAL}/checkpoints/best/"
+echo "  Or on EC2: ls outputs/act_trial${TRIAL}/checkpoints/last/pretrained_model/"

@@ -47,6 +47,7 @@ fi
 echo ""
 echo "[pixi] Reinstalling packages..."
 pixi install --locked
+pixi reinstall ros-kilted-lerobot-robot-aic 2>/dev/null || true
 pixi reinstall ros-kilted-aic-example-policies 2>/dev/null || true
 echo "[pixi] Done."
 
@@ -55,7 +56,7 @@ echo "[pixi] Done."
 # ---------------------------------------------------------------
 echo ""
 echo "[configs] Generating demo configs..."
-python3 aic_example_policies/scripts/generate_demo_configs.py
+pixi run python3 aic_example_policies/scripts/generate_demo_configs.py
 
 T1_COUNT=$(ls aic_example_policies/configs/demo_configs/t1/ 2>/dev/null | wc -l)
 T2_COUNT=$(ls aic_example_policies/configs/demo_configs/t2/ 2>/dev/null | wc -l)
@@ -92,10 +93,10 @@ fi
 echo ""
 echo "[training] Checkpoint status:"
 for TRIAL in 1 2 3; do
-  BEST_DIR="outputs/act_trial${TRIAL}/checkpoints/best"
-  LAST_DIR=$(ls -dt "outputs/act_trial${TRIAL}/checkpoints/"* 2>/dev/null | head -1 || true)
-  if [ -d "$BEST_DIR" ]; then
-    echo "  Trial ${TRIAL}: DONE — best/ exists ($(ls "$BEST_DIR" | wc -l) files)"
+  PRETRAINED_DIR="outputs/act_trial${TRIAL}/checkpoints/last/pretrained_model"
+  LAST_DIR=$(find "outputs/act_trial${TRIAL}/checkpoints" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1 || true)
+  if [ -f "$PRETRAINED_DIR/config.json" ] && [ -f "$PRETRAINED_DIR/model.safetensors" ]; then
+    echo "  Trial ${TRIAL}: DONE — last/pretrained_model exists ($(ls "$PRETRAINED_DIR" | wc -l) files)"
   elif [ -n "$LAST_DIR" ]; then
     LAST_STEP=$(basename "$LAST_DIR")
     echo "  Trial ${TRIAL}: IN PROGRESS — latest checkpoint: $LAST_STEP"

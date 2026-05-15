@@ -81,7 +81,7 @@ requires a teleop to generate the action side of `(observation, action)` pairs.
 | `scripts/smoke_test.sh` | Quick ROS communication check |
 | `scripts/aws_setup.sh` | One-shot EC2 setup |
 | `scripts/check_gpu.sh` | GPU passthrough diagnostic |
-| `scripts/train_act.sh` | Training launcher (not modified) |
+| `scripts/train_act.sh` | Training launcher |
 | `aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_teleop.py` | aic_cheatcode teleop |
 | `aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_robot_aic_controller.py` | lerobot robot adapter |
 | `aic_example_policies/aic_example_policies/ros/CheatCode.py` | CheatCode aic_model policy |
@@ -172,3 +172,10 @@ Training launches as each trial completes (prompted by the script):
 ./scripts/train_act.sh 2   # T2
 ./scripts/train_act.sh 3   # T3
 ```
+
+LeRobot 0.5.1 writes deployable policy files under:
+```bash
+outputs/act_trialN/checkpoints/last/pretrained_model/
+```
+That directory is what `copy_checkpoints.sh` pulls from EC2 and what
+`build_and_submit.sh` stages into `aic_example_policies/checkpoints/{sfp,sc}`.

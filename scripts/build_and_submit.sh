@@ -41,7 +41,7 @@ SFP_SRC=""
 SC_SRC=""
 
 for TRIAL in 1 2; do
-  DIR="outputs/act_trial${TRIAL}/checkpoints/best"
+  DIR="outputs/act_trial${TRIAL}/checkpoints/last/pretrained_model"
   if [ -d "$DIR" ]; then
     SFP_SRC="$DIR"
     echo "  SFP model: $SFP_SRC (trial ${TRIAL})"
@@ -49,14 +49,14 @@ for TRIAL in 1 2; do
   fi
 done
 
-if [ -d "outputs/act_trial3/checkpoints/best" ]; then
-  SC_SRC="outputs/act_trial3/checkpoints/best"
+if [ -d "outputs/act_trial3/checkpoints/last/pretrained_model" ]; then
+  SC_SRC="outputs/act_trial3/checkpoints/last/pretrained_model"
   echo "  SC  model: $SC_SRC (trial 3)"
 fi
 
 if [ -z "$SFP_SRC" ]; then
   echo "ERROR: No SFP checkpoint found."
-  echo "  Expected: outputs/act_trial1/checkpoints/best/ or outputs/act_trial2/checkpoints/best/"
+  echo "  Expected: outputs/act_trial1/checkpoints/last/pretrained_model/ or outputs/act_trial2/checkpoints/last/pretrained_model/"
   echo "  Run: ./scripts/copy_checkpoints.sh <ec2-dns>  first."
   exit 1
 fi
@@ -93,6 +93,12 @@ for SUBDIR in sfp sc; do
   COUNT=$(ls "aic_example_policies/checkpoints/${SUBDIR}/" 2>/dev/null | wc -l)
   if [ "$COUNT" -eq 0 ]; then
     echo "ERROR: aic_example_policies/checkpoints/${SUBDIR}/ is empty after staging."
+    exit 1
+  fi
+  if [ ! -f "aic_example_policies/checkpoints/${SUBDIR}/config.json" ] || \
+     [ ! -f "aic_example_policies/checkpoints/${SUBDIR}/model.safetensors" ]; then
+    echo "ERROR: aic_example_policies/checkpoints/${SUBDIR}/ is not a LeRobot pretrained_model directory."
+    echo "Expected config.json and model.safetensors at the top level."
     exit 1
   fi
   echo "  checkpoints/${SUBDIR}/: ${COUNT} files"
