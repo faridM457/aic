@@ -48,6 +48,8 @@ LOG_FILE=~/ws_aic/collection_log.txt
 DONE_FLAG=/tmp/aic_cheatcode_done
 SECONDS_PER_EP=25   # estimated seconds per episode for ETA
 REC_LOG=/tmp/aic_collect_lerobot_record.log
+REC_STATUS=/tmp/aic_collect_lerobot_record.status
+REC_WRAPPER=/tmp/aic_collect_lerobot_record.sh
 
 cd "$AIC_DIR"
 
@@ -255,29 +257,67 @@ collect_trial() {
         mv "$LOCAL_DS_ROOT" "$INCOMPLETE_ROOT"
       fi
       > "$REC_LOG"
+      rm -f "$REC_STATUS"
+      cat > "$REC_WRAPPER" <<'SH'
+#!/bin/bash
+set +e
+
+AIC_DIR="$1"
+TELEOP_TRIAL="$2"
+DATASET="$3"
+LOCAL_DS_ROOT="$4"
+TASK_DESC="$5"
+REC_RESUME_ARG="$6"
+REC_LOG="$7"
+REC_STATUS="$8"
+
+{
+  echo "[aic_collect] starting lerobot-record at $(date)"
+  echo "[aic_collect] cwd: $AIC_DIR"
+  echo "[aic_collect] dataset: $DATASET"
+  echo "[aic_collect] dataset.root: $LOCAL_DS_ROOT"
+  echo "[aic_collect] resume arg: ${REC_RESUME_ARG:-<none>}"
+
+  cd "$AIC_DIR" || {
+    status=$?
+    echo "[aic_collect] cd failed with exit code: $status"
+    echo "$status" > "$REC_STATUS"
+    exit "$status"
+  }
+
+  cmd=(
+    pixi run lerobot-record
+    --robot.type=aic_controller
+    --robot.id=aic
+    --robot.teleop_target_mode=cartesian
+    --robot.teleop_frame_id=base_link
+    --teleop.type=aic_cheatcode
+    --teleop.id=aic
+    "--teleop.trial_type=${TELEOP_TRIAL}"
+    "--dataset.repo_id=${DATASET}"
+    "--dataset.root=${LOCAL_DS_ROOT}"
+    "--dataset.single_task=${TASK_DESC}"
+    --dataset.num_episodes=1
+    --dataset.push_to_hub=false
+    --play_sounds=false
+  )
+  if [ -n "$REC_RESUME_ARG" ]; then
+    cmd+=("$REC_RESUME_ARG")
+  fi
+
+  echo "[aic_collect] command: PYTHONUNBUFFERED=1 ${cmd[*]}"
+  PYTHONUNBUFFERED=1 "${cmd[@]}"
+  status=$?
+  echo "[aic_collect] lerobot-record exit code: $status"
+  echo "$status" > "$REC_STATUS"
+  exit "$status"
+} >> "$REC_LOG" 2>&1
+SH
+      chmod +x "$REC_WRAPPER"
+
       tmux new-session -d -s aic_collect_rec -x 220 -y 50
-      tmux send-keys -t aic_collect_rec:0 \
-        "cd $AIC_DIR && { \
-          echo '[aic_collect] starting lerobot-record at '\"\$(date)\"; \
-          PYTHONUNBUFFERED=1 pixi run lerobot-record \
-           --robot.type=aic_controller \
-           --robot.id=aic \
-           --robot.teleop_target_mode=cartesian \
-           --robot.teleop_frame_id=base_link \
-           --teleop.type=aic_cheatcode \
-           --teleop.id=aic \
-           --teleop.trial_type=${TELEOP_TRIAL} \
-           --dataset.repo_id=${DATASET} \
-           --dataset.root=${LOCAL_DS_ROOT} \
-           --dataset.single_task='${TASK_DESC}' \
-           --dataset.num_episodes=1 \
-           --dataset.push_to_hub=false \
-           ${REC_RESUME_ARG} \
-           --play_sounds=false; \
-          status=\$?; \
-          echo '[aic_collect] lerobot-record exit code: '\$status; \
-          exit \$status; \
-        } >> '$REC_LOG' 2>&1" Enter
+      REC_CMD=$(printf "%q " "$REC_WRAPPER" "$AIC_DIR" "$TELEOP_TRIAL" "$DATASET" "$LOCAL_DS_ROOT" "$TASK_DESC" "$REC_RESUME_ARG" "$REC_LOG" "$REC_STATUS")
+      tmux send-keys -t aic_collect_rec:0 "$REC_CMD" Enter
 
       # Verify lerobot-record reaches teleop.connect(). LeRobot creates the
       # aic_cheatcode_teleop node only after dataset setup and robot.connect().
@@ -285,8 +325,10 @@ collect_trial() {
       TELEOP_NODE_CHECK=""
       ROBOT_NODE_CHECK=""
       for _ in $(seq 1 18); do
-        if ! pgrep -f "lerobot-record" >/dev/null 2>&1; then
+        if [ -f "$REC_STATUS" ]; then
+          REC_EXIT_CODE=$(cat "$REC_STATUS" 2>/dev/null || echo "unknown")
           echo "  ERROR: lerobot-record exited during startup (attempt $ATTEMPT) — retrying"
+          echo "  DIAG: lerobot-record exit code: $REC_EXIT_CODE"
           echo "  DIAG: lerobot-record log tail:"
           tail -80 "$REC_LOG" 2>/dev/null || true
           kill_sessions
