@@ -260,6 +260,7 @@ collect_trial() {
            --teleop.id=aic \
            --teleop.trial_type=${TELEOP_TRIAL} \
            --dataset.repo_id=${DATASET} \
+           --dataset.root=${LOCAL_DS_ROOT} \
            --dataset.single_task='${TASK_DESC}' \
            --dataset.num_episodes=1 \
            --dataset.push_to_hub=false \
