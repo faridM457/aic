@@ -2,11 +2,11 @@
 """
 Re-publishes /tf_static transforms to /tf at 2 Hz so host-side nodes can see them.
 
-Runs on the HOST via pixi BEFORE docker run. ground_truth_static_tf_publisher
-publishes /tf_static (TRANSIENT_LOCAL) exactly once when the task board spawns
-then shuts down. Zenoh cannot replay cached TRANSIENT_LOCAL messages to late
-subscribers across the container boundary, so this relay must already be
-subscribed when the live publish occurs.
+Runs INSIDE the eval container via docker exec. Zenoh does not bridge
+TRANSIENT_LOCAL QoS (/tf_static) across the container/host boundary, so the
+relay must run inside the container where it can receive cached static TF.
+It re-publishes every transform to /tf (RELIABLE), which Zenoh does bridge,
+making task_board frames visible to the host tf2 stack.
 """
 import rclpy
 from rclpy.node import Node
