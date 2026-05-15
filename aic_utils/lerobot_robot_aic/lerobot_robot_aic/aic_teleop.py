@@ -23,7 +23,8 @@ from typing import Any, cast
 
 import pyspacemouse
 import rclpy
-from geometry_msgs.msg import Twist
+from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, Wrench
 from lerobot.teleoperators import Teleoperator, TeleoperatorConfig
 from lerobot.teleoperators.keyboard import (
     KeyboardEndEffectorTeleop,
@@ -444,8 +445,10 @@ class AICCheatCodeTeleop(Teleoperator):
         self._tf_buffer: Buffer | None = None
         self._scoring_tf_sub = None
         self._insertion_event_sub = None
+        self._motion_pub = None
         self._executor = None
         self._executor_thread: Thread | None = None
+        self._drive_thread: Thread | None = None
 
         self._phase: str = "WAIT"
         self._port_transform = None
@@ -458,6 +461,7 @@ class AICCheatCodeTeleop(Teleoperator):
         self._tip_y_error_integrator: float = 0.0
         self._max_integrator_windup: float = 0.05
         self._last_pose_action: PoseMotionUpdateActionDict | None = None
+        self._stop_drive: bool = False
 
     @property
     def name(self) -> str:
@@ -497,11 +501,16 @@ class AICCheatCodeTeleop(Teleoperator):
             TFMessage, '/scoring/tf', self._on_scoring_tf, 10)
         self._insertion_event_sub = self._node.create_subscription(
             String, "/scoring/insertion_event", self._on_insertion_event, 10)
+        self._motion_pub = self._node.create_publisher(
+            MotionUpdate, "/aic_controller/pose_commands", 10)
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._executor_thread = Thread(target=self._executor.spin, daemon=True)
         self._executor_thread.start()
         self._is_connected = True
+        self._stop_drive = False
+        self._drive_thread = Thread(target=self._drive_sequence, daemon=True)
+        self._drive_thread.start()
         if os.path.exists(self.config.done_flag_path):
             os.remove(self.config.done_flag_path)
         print(
@@ -651,9 +660,7 @@ class AICCheatCodeTeleop(Teleoperator):
             })
         t = gripper_tf.transform.translation
         q = gripper_tf.transform.rotation
-        action = self._pose_action((t.x, t.y, t.z), (q.w, q.x, q.y, q.z))
-        self._last_pose_action = action
-        return cast(dict, action)
+        return cast(dict, self._pose_action((t.x, t.y, t.z), (q.w, q.x, q.y, q.z)))
 
     def _calc_gripper_pose_action(
         self,
@@ -761,80 +768,114 @@ class AICCheatCodeTeleop(Teleoperator):
             print(message)
             self._last_status_log = now
 
-    def get_action(self) -> dict[str, Any]:
-        if not self._is_connected:
-            raise DeviceNotConnectedError()
+    @staticmethod
+    def _diag(values: list[float]) -> list[float]:
+        matrix = [0.0] * 36
+        for idx, value in enumerate(values):
+            matrix[idx * 6 + idx] = value
+        return matrix
 
-        cfg = self.config
+    def _publish_pose_action(self, action: PoseMotionUpdateActionDict) -> None:
+        if self._node is None or self._motion_pub is None:
+            return
+        msg = MotionUpdate()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.pose = Pose(
+            position=Point(
+                x=float(action["target_position.x"]),
+                y=float(action["target_position.y"]),
+                z=float(action["target_position.z"]),
+            ),
+            orientation=Quaternion(
+                x=float(action["target_orientation.x"]),
+                y=float(action["target_orientation.y"]),
+                z=float(action["target_orientation.z"]),
+                w=float(action["target_orientation.w"]),
+            ),
+        )
+        msg.target_stiffness = self._diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0])
+        msg.target_damping = self._diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0])
+        msg.feedforward_wrench_at_tip = Wrench(
+            force=Vector3(x=0.0, y=0.0, z=0.0),
+            torque=Vector3(x=0.0, y=0.0, z=0.0),
+        )
+        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
+        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+        self._motion_pub.publish(msg)
 
-        if self._insertion_event_seen:
-            self._set_phase("DONE")
-            self._write_done_flag("insertion_event")
-            return self._hold_pose_action()
-
-        # ------------------------------------------------------------------
-        # WAIT: poll until TF frames are available
-        # ------------------------------------------------------------------
-        if self._phase == "WAIT":
+    def _drive_sequence(self) -> None:
+        while not self._stop_drive and not self._insertion_event_seen:
             port_tf = self._lookup_transform(self._port_frame)
             port_xyz = self._lookup_xyz(self._port_frame)
             tip_xyz = self._lookup_tip_xyz()
             tcp_xyz = self._lookup_xyz("gripper/tcp")
-            if port_tf is None or port_xyz is None or tip_xyz is None or tcp_xyz is None:
-                self._log_status(
-                    "[aic_cheatcode] Waiting for TF: "
-                    f"port={port_xyz is not None} tip={tip_xyz is not None} "
-                    f"tcp={tcp_xyz is not None}"
+            if port_tf is not None and port_xyz is not None and tip_xyz is not None and tcp_xyz is not None:
+                self._port_transform = port_tf.transform
+                self._approach_step = 0
+                self._z_offset = 0.2
+                self._set_phase("APPROACH")
+                print(
+                    f"[aic_cheatcode] TF ready - port={port_xyz} tip={tip_xyz} "
+                    f"tip_frame={self._active_tip_frame} -> APPROACH"
                 )
-                return self._hold_pose_action()
-            self._port_transform = port_tf.transform
-            self._approach_step = 0
-            self._z_offset = 0.2
-            self._set_phase("APPROACH")
-            print(
-                f"[aic_cheatcode] TF ready - port={port_xyz} tip={tip_xyz} "
-                f"tip_frame={self._active_tip_frame} -> APPROACH"
+                break
+            self._log_status(
+                "[aic_cheatcode] Waiting for TF: "
+                f"port={port_xyz is not None} tip={tip_xyz is not None} "
+                f"tcp={tcp_xyz is not None}"
             )
+            time.sleep(0.05)
 
-        # ------------------------------------------------------------------
-        # APPROACH: match CheatCode.py by interpolating over 100 pose targets.
-        # ------------------------------------------------------------------
-        if self._phase == "APPROACH":
-            if self._approach_step >= 100:
-                self._set_phase("DESCEND")
-                print("[aic_cheatcode] Finished approach -> DESCEND")
-                return self._hold_pose_action()
-            interp_fraction = self._approach_step / 100.0
-            self._approach_step += 1
+        for step in range(100):
+            if self._stop_drive or self._insertion_event_seen:
+                break
+            self._phase = "APPROACH"
             action = self._calc_gripper_pose_action(
-                slerp_fraction=interp_fraction,
-                position_fraction=interp_fraction,
+                slerp_fraction=step / 100.0,
+                position_fraction=step / 100.0,
                 z_offset=self._z_offset,
                 reset_xy_integrator=True,
             )
-            return action if action is not None else self._hold_pose_action()
+            if action is not None:
+                self._last_pose_action = cast(PoseMotionUpdateActionDict, action)
+                self._publish_pose_action(self._last_pose_action)
+            time.sleep(0.05)
 
-        # ------------------------------------------------------------------
-        # DESCEND: match CheatCode.py by walking z_offset down to -0.015.
-        # ------------------------------------------------------------------
-        if self._phase == "DESCEND":
+        if not self._stop_drive and not self._insertion_event_seen:
+            self._set_phase("DESCEND")
+            print("[aic_cheatcode] Finished approach -> DESCEND")
+
+        while not self._stop_drive and not self._insertion_event_seen:
             if self._z_offset < -0.015:
                 self._set_phase("DONE")
                 self._write_done_flag("cheatcode_descent_complete")
-                return self._hold_pose_action()
+                break
             self._z_offset -= 0.0005
             action = self._calc_gripper_pose_action(z_offset=self._z_offset)
-            return action if action is not None else self._hold_pose_action()
+            if action is not None:
+                self._last_pose_action = cast(PoseMotionUpdateActionDict, action)
+                self._publish_pose_action(self._last_pose_action)
+            time.sleep(0.05)
 
-        # ------------------------------------------------------------------
-        # DONE
-        # ------------------------------------------------------------------
+        if self._insertion_event_seen:
+            self._set_phase("DONE")
+            self._write_done_flag("insertion_event")
+
+    def get_action(self) -> dict[str, Any]:
+        if not self._is_connected:
+            raise DeviceNotConnectedError()
+        if self._last_pose_action is not None:
+            return cast(dict, self._last_pose_action)
         return self._hold_pose_action()
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         pass
 
     def disconnect(self) -> None:
+        self._stop_drive = True
+        if self._drive_thread:
+            self._drive_thread.join(timeout=2.0)
         if self._node:
             self._node.destroy_node()
         if self._executor:
@@ -857,4 +898,5 @@ class AICCheatCodeTeleop(Teleoperator):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
         self._last_pose_action = None
+        self._stop_drive = False
         print("[aic_cheatcode] Reset for new episode")
